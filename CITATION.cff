@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the related publication as below."
+preferred-citation:
+  authors:
+  - family-names: "Klöcker"
+    given-names: "C. Antonia"
+    orcid: "https://orcid.org/0000-0001-7552-7892"
+    email: antonia.kloecker@hi.no
+    affiliation: Institute of Marine Research, Norway
+  - family-names: "Albert"
+    given-names: "Ole-Thomas"
+  - family-names: "Albert"
+    given-names: "Ole-Thomas"
+  - family-names: "Ferter"
+    given-names: "Keno P."
+  - family-names: "Bjelland"
+    given-names: "Otte"
+  - family-names: "Lennox"
+    given-names: "Robert J."
+  - family-names: "Albretsen"
+    given-names: "Jon"
+  - family-names: "Pohl"
+    given-names: "Lotte"
+  - family-names: "Dahlmo"
+    given-names: "Lotte Svengård"
+  - family-names: "Queiroz"
+    given-names: "Nuno"
+  - family-names: "Junge"
+    given-names: "Claudia"
+    orcid: "https://orcid.org/0000-0001-7709-3856"
+    email: claudia.junge@hi.no
+    affiliation: Institute of Marine Research, Norway
+  title: "Seasonal habitat use and diel vertical migration in female spurdogs in Nordic waters"
+  type: generic
+  year: 2024
+  keywords: 
+  - biologging
+  - "archival tag"
+  - PSAT
+  - sharks
+  - DVM
+  - "wavelet analysis"
+  - "fast starts"
+  - niche
+  - fishery
+  - "North-East Atlantic"

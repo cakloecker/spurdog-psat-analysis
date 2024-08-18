@@ -1,0 +1,1722 @@
+---
+title: "Analysis & plots for paper: Seasonal habitat use and diel vertical migration in female spurdog in Nordic waters, Movement Ecology"
+author: |
+  Antonia Kloecker, IMR <antonia.kloecker@hi.no>
+date: "Version: `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  bookdown::html_document2:
+    toc: true
+    theme: lumen
+    toc_float: true
+    toc_depth: 5
+    collapsed: false
+    variant: markdown+simple_table
+    fig_caption: true
+    number_sections: true
+    code_folding: hide
+header-includes:
+ \usepackage{float}
+ \floatplacement{figure}{H}
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.pos = "H",
+                      fig.width=10,
+                      fig.height=8,
+                      tab.pos = "H",
+                      collapse = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      comment = "#>"
+)
+
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+options(knitr.kable.NA = "")
+```
+
+```{r, include=FALSE}
+# load packages
+library(tidyverse)
+library(viridis)
+library(factoextra) # distance matrix/dendrogramme
+library(patchwork) # multi panel plots
+library(biwavelet) # cluster analaysis for wavelet
+library(factoextra) # dendrogramme vis
+library(ggsignif) # add sig bars/annotations
+# source functions
+source("processing/spurdog/00_functions.R")
+```
+
+# Read data
+
+In here we read archival PSAT data of 19 tags deployed between 2019 and 2023 on pregnant spurdog (TL>85cm) in the Norwegian fjord system around the city of Bergen.
+The 5s resolution archival data has been summarised on a level of minutes, hours and days in `01_archive-preprocessing.R`. It was cleaned in `02_data-cleaning.R` to remove potential tagging or capture effects. Subsequently a wavelet analysis was performed in `03_wavelet-analysis.R` for the hourly depth timeseries amongst others to add DVM as a covariate.
+
+```{r}
+# read in cleaned archival data
+mdata <- readr::read_rds("data/spurdog/processed_data/archives-minutely-cleaned.rds") 
+hdata <- readr::read_rds("data/spurdog/processed_data/archive_hourly_DVM_wavelet.rds")
+ddata <- readr::read_rds("data/spurdog/processed_data/archives-daily-cleaned.rds")
+# Note: takes a couple of min to load 5 sec res data for all sharks
+data <- readRDS("D:/development/SharksOnTheMove/PSAT/data/spurdog/processed_data/archives-full-cleaned.rds")
+#data <- readRDS("D:/development/SharksOnTheMove/PSAT/data/spurdog/processed_data/archives-full-cleaned-5d.rds") # first five instead of 1 d removed
+
+# wavelet specific output
+wtavg <- readr::read_rds(file = "data/spurdog/processed_data/archive_hourly_depth_avgwavelet.rds")
+wtc <- readr::read_rds(file = "data/spurdog/processed_data/archive_hourly_depth_compWave.rds")
+wt <- readr::read_rds(file = "data/spurdog/processed_data/archive_hourly_nested_wavelet_depth_1_24_wodata.rds")
+wtFS <- readr::read_rds(file = "data/spurdog/processed_data/archive_hourly_nested_wavelet_FS95cum_1_24_wodata.rds")
+# store tag and shark id in a vector
+tags <- list.files("data/spurdog/rawdata/")
+sharks <- 1:length(tags)
+```
+
+CTD profiles station H2
+```{r}
+H2 <- read_table("data/spurdog/CTDstations/temp_H2_2019-2023.asc", na = "NaN") %>% 
+  pivot_longer(!Depth, names_to = "Date", values_to = "Temp") %>% 
+  mutate(Date = ymd(Date),
+         Month = factor(lubridate::month(Date, label = T, abbr = F),
+                 levels = c("November","December","January","February","March",
+                            "April","May","June", "July", "August","September","October")),
+         Year = year(Date)) %>% 
+  filter(Date >= min(ddata$Date) & Date <= max(ddata$Date)) %>% 
+  na.omit()
+```
+
+Add DVM covariate to minutely and daily data (so far only in hourly data - with which wavelet analysis was performed).
+```{r}
+# Daily data
+t1 <- hdata %>% 
+      select(Date, DateTime, DVM, tagID) %>% 
+      # obtain the most frequent behaviour across each day
+      group_by(tagID, Date, DVM) %>% 
+      summarise(c=n()) %>% 
+      filter(row_number(desc(c))==1) %>% 
+      ungroup() %>% 
+      select(tagID, Date, DVM)
+ddata <- left_join(ddata, t1, by = c("tagID","Date"))
+
+# Minutely data
+t2 <- hdata %>% select(tagID, DateTime, DVM)
+mdata <- left_join(mdata, t2, by = c("tagID","DateTime")) %>% fill(DVM, .direction = "downup")
+```
+
+# Data coverage
+
+Let's get an overview of what the coverage of the data is. Not all tags remained on the shark for the same length of time. They were also deployed in different years.
+
+```{r}
+t <- ddata %>% group_by(sharkID) %>% summarise(n = n(), date_start = range(Date)[1], date_end = range(Date)[2])
+t
+mean(t$n)
+sum(t$n)
+```
+
+Overall, this dataset comprises cumulative `r sum(t$n)` days of timeseries data, with a mean of `r mean(t$n)` days. Splitting that into quantiles looks like this:
+
+```{r}
+quantile(t$n,c(0,0.25,0.5,0.75,1))
+```
+
+Let's visualise this.
+```{r}
+ggplot(ddata %>% add_count(tagID) %>% 
+         mutate(release = 
+                  case_when(tagID %in% c("17P0023","17P0749","17P0796","17P0864","17P0866","21P0036","21P0038","21P0039","21P2202","21P2203","21P2209") ~ "programmed",
+                            tagID %in% c("20P2046", "20P2660") ~ "recapture",
+                            tagID %in% c("20P2042","20P2044","20P2045","20P2046", "20P2047","21P0037","21P2088") ~ "premature tag loss")
+                ),
+       )+
+  geom_vline(xintercept = c(as.Date("2020-01-01"),as.Date("2021-01-01"),as.Date("2022-01-01"), as.Date("2023-01-01")), linetype='solid')+
+  geom_vline(xintercept = c(as.Date("2020-07-01"),as.Date("2021-07-01"),as.Date("2022-07-01"),as.Date("2023-07-01")), linetype='dotted')+
+  geom_line(aes(x = Date, y = tagID, col = release),linewidth = 5) +
+  scale_colour_manual(values = c("#e6550d", "#31a354", "#756bb1"), name= "Release Type")+
+  labs(y= "", x ="")+
+  scale_x_date(date_breaks = "3 month",date_labels = "%b %y")+
+  theme(legend.position = "bottom")+
+  guides(fill=guide_legend(nrow=1,byrow=TRUE))
+#ddata %>% group_by(tagID) %>% count
+
+# for poster
+ggplot(ddata %>% add_count(tagID) %>% mutate(sharkID = fct_rev(sharkID)))+
+  geom_vline(xintercept = c(as.Date("2020-01-01"),as.Date("2021-01-01"),as.Date("2022-01-01"), as.Date("2023-01-01")), linetype='solid')+
+  geom_vline(xintercept = c(as.Date("2020-07-01"),as.Date("2021-07-01"),as.Date("2022-07-01"),as.Date("2023-07-01")), linetype='dotted')+
+  geom_line(aes(x = Date, y = sharkID, col = cohort),linewidth = 5) +
+  scale_colour_manual(values = c("#34a2e5ff","#5fb667ff", "#feb55dff","#cd0e5bff"), name= "cohort")+
+  labs(y= "Shark ID", x ="")+
+  scale_x_date(date_breaks = "3 month",date_labels = "%b %y")+
+  theme(legend.position = "bottom")+
+  guides(fill=guide_legend(nrow=1,byrow=TRUE))+
+  theme_classic()
+ggsave(filename = "plots/spurdog/deployment_overview_poster.png", width = 9, height = 5)
+```
+
+# Summary statisics
+
+## Overall
+
+Across individuals and the entire deployment period, sharks occupied a mean depth of 56.5 m (IQR 21.5-128.5, range 0-643.5m)
+
+```{r}
+# depth
+quantile(data$Depth, probs = c(0,0.25,0.5,0.75,1)) # range, IQR,median
+#quantile(mdata$Depth_median, probs = c(0,0.25,0.5,0.75,1)) # range, IQR,median
+```
+
+```{r}
+# temp
+round(quantile(data$Temperature, probs = c(0,0.25,0.5,0.75,1)),1)
+#round(quantile(mdata$Temp_median, probs = c(0,0.25,0.5,0.75,1)),1) # range, IQR, median
+```
+
+
+### TAD & TAT - weighted by reciprocal yday
+
+Figure S4: Time-at-depth (A) and time-at-temperature (B) histograms for the entire deployment. Bars represent mean percentage of time (summarised by date) spent across individuals in each of the twelve depth and eight temperature bins. The means were weighted by the reciprocal of data points per Julian day to account for the heterogeneous temporal coverage due to different deployment lengths. Error bars indicate standard errors.
+
+```{r}
+# depth
+TADd <- mdata %>%
+      mutate(depth_bin = cut(Depth_median,breaks=c(0,10,25,50,75,100,150,200,300,400,500,600,700), include.lowest = T),
+             yday = yday(Date)) %>% 
+      group_by(Date) %>% 
+      mutate(n_min = n()) %>%  # minutes available per date
+      ungroup() %>% 
+      group_by(yday) %>% 
+      mutate(w_yday =1/n()) %>% 
+      ungroup() %>% 
+      group_by(Date, depth_bin, w_yday) %>% #not per sharkID - not interested in the interind. dif at this stage, no major differences 
+      reframe(TADperc = (n()/mean(n_min))*100) %>%  # count minutes in each bin per date and divide by available minutes per day 
+      # ensure that that non-occupied depth bins are zero (instead of absent)
+      pivot_wider(names_from = depth_bin, values_from = TADperc) %>% 
+      replace(is.na(.), 0) %>% 
+      pivot_longer(!c(Date,w_yday), names_to = "depth_bin", values_to = "TADperc") %>% 
+      mutate(depth_bin = factor(depth_bin, levels = c("(600,700]","(500,600]","(400,500]","(300,400]",
+                                                      "(200,300]","(150,200]","(100,150]","(75,100]",
+                                                      "(50,75]","(25,50]","(10,25]","[0,10]"))) %>% 
+      # calculate mean and se per depth bin (aggregate over dates)
+      group_by(depth_bin) %>%  
+      reframe(mean = weighted.mean(TADperc, w= w_yday),
+              se = diagis::weighted_se(TADperc, w= w_yday))#sd(TADperc)/sqrt(n())) 
+
+p1 <- ggplot(data = TADd, 
+       aes(y = depth_bin, x=mean, xmin = mean-se, xmax = mean+se))+
+  geom_bar(stat = "identity",  fill = "turquoise4", alpha = 0.5, colour = "grey10")+
+  geom_errorbar(width = 0.2)+ # if error bar is missing - only one day per month
+  #geom_hline(yintercept = c(11.5, 5.5), linetype = "dashed", colour = 'grey30', linewidth = 0.5)+ #"(200,250]"
+  theme_bw()+
+  labs(y = "Depth [m]", x = "Time [%]")
+
+#first 75m
+sum(TADd$mean[9:12])
+# Time at epipelagic
+sum(TADd$mean[6:12])
+# Time at mesopelagic
+sum(TADd$mean[1:5])
+
+#temp
+TATd <- mdata %>%
+      mutate(depth_bin = cut(Temp_median,breaks=seq(4,20,2), include.lowest = T),
+             yday = yday(Date)) %>% 
+      group_by(Date) %>% 
+      mutate(n_min = n()) %>%  # minutes available per date
+      ungroup() %>% 
+      group_by(yday) %>% 
+      mutate(w_yday =1/n()) %>% 
+      ungroup() %>% 
+      group_by(Date, depth_bin, w_yday) %>% #not per sharkID - not interested in the interind. dif at this stage, no major differences 
+      reframe(TADperc = (n()/mean(n_min))*100) %>%  # count minutes in each bin per date and divide by available minutes per day 
+      # ensure that that non-occupied depth bins are zero (instead of absent)
+      pivot_wider(names_from = depth_bin, values_from = TADperc) %>% 
+      replace(is.na(.), 0) %>% 
+      pivot_longer(!c(Date,w_yday), names_to = "depth_bin", values_to = "TADperc") %>% 
+       mutate(depth_bin = factor(depth_bin, levels = c("[4,6]","(6,8]","(8,10]","(10,12]","(12,14]",
+                                                      "(14,16]","(16,18]","(18,20]")))  %>% 
+      # calculate mean and se per depth bin (aggregate over dates)
+      group_by(depth_bin) %>%  
+      reframe(mean = weighted.mean(TADperc, w= w_yday),
+              se = diagis::weighted_se(TADperc, w= w_yday))#sd(TADperc)/sqrt(n())) 
+
+p2 <- ggplot(data = TATd, 
+       aes(y = depth_bin, x=mean, xmin = mean-se, xmax = mean+se))+
+  geom_bar(stat = "identity", fill = "turquoise4", alpha = 0.5, colour = "grey10")+
+  geom_errorbar(width = 0.2)+ # if error bar is missing - only one day per month
+  theme_bw()+
+  labs(y = "Temperature [\u00B0C]", x = "Time [%]")
+
+p <- (p1|p2)+ plot_annotation(tag_levels = 'A')
+
+p
+ggsave(p, filename = "plots/spurdog/supplement/fig4_TAD_TAT_weighted.png", width = 10, height = 7)
+
+
+#8-10
+TATd$mean[3]
+TATd$se[3]
+#10-12
+TATd$mean[4]
+TATd$se[4]
+#12-14
+TATd$mean[5]
+TATd$se[5]
+```
+
+## Per month
+
+### Boxplot
+Figure S5: Average daily depth (A) and temperature (B) use across the different months of deployment based on 1-minute interval median depth and temperature values. Boxplots show the average median, boxes indicate the interquartile range (IQR – 25 and 75% quartiles) and whiskers extent to the average daily minimum and maximum depth and temperature per month.
+
+Daily median depths decrease continuously from September (16.3±0.8m standard error) to January (94.8±1.5m) when they stay between 80-86 m until April. In May, mean daily depths decrease to 66.4±3.2m, dropping to 22.5±3.6m in June, subsequently remaining at shallow depths until November around 20-40m. On average, daily depth ranges and IQR are particularly high in the winter and spring (Dec-May) with ranges around 300m, and IQRs between 79.9-114.3m whereas in August and September mean daily ranges between minimum and maximum depths are around 170m and IQR include only 16 m (Sep-Oct). Noticeably, mean daily minimum depth do not extend to surface waters (<10 m) from December until March (16.4±1.0m - 29.8±1.4m). From July until October mean daily maximal depth does not extend down to the mesopelagic zone (>200m) reaching on average to around 184m. Mean daily temperatures continuously drop from September (13.9±0.1°C) to April (8.4±0.0°C). From May on occupied water temperatures increase from 8.4±0.0°C until September. The IQR of temperatures, which incorporates variation across all minutely temperatures recorded per date across individuals,  is greatest in June, July, August, and November (2.1-2.9°C). This trend is also apparent in the overall temperature range, which in July for example extends from 8.1±0.1 to 15.1±0.1°C. The corresponding range in April is only 7.5±0.0 - 9.5±0.0°C.
+
+```{r}
+# mean daily median, min and max depth/temp per month
+
+md <- mdata %>%
+      mutate(Month = factor(lubridate::month(Date, label = T, abbr = T), 
+                            levels = c("Nov","Dec","Jan","Feb","Mar","Apr","May","Jun", "Jul", "Aug","Sep","Oct"))) %>% 
+      group_by(Date, Month) %>% 
+      reframe(Dmin = min(Depth_median),# minimum per day across ind 
+              Dmax = max(Depth_median),# maximum per day across ind 
+              Dmed = median(Depth_median),
+              D_lq = quantile(Depth_median, probs = c(0.25)),
+              D_uq = quantile(Depth_median, probs = c(0.75)),
+              Tmin = min(Temp_median),
+              Tmed = median(Temp_median),
+              Tmax = max(Temp_median),
+              T_lq = quantile(Temp_median, probs = c(0.25)),
+              T_uq = quantile(Temp_median, probs = c(0.75))) %>%       
+        ungroup() %>% 
+      group_by(Month) %>% 
+     reframe(n = n(),
+             Dmin_mu = round(mean(Dmin),1),
+              Dmin_sd = round(sd(Dmin),1),
+              Dmin_se = round(sd(Dmin)/sqrt(n()),1),
+              Dmed_mu = round(mean(Dmed),1),
+              Dmed_sd = round(sd(Dmed),1),
+              Dmed_se = round(sd(Dmed)/sqrt(n()),1),
+              Dmax_mu = round(mean(Dmax),1),
+              Dmax_se = round(sd(Dmax)/sqrt(n()),1),
+              Dmax_sd = round(sd(Dmax),1),
+              D_lq = round(mean(D_lq),1),
+              D_uq = round(mean(D_uq),1),
+              Tmin_mu = round(mean(Tmin),1),
+              Tmin_se = round(sd(Tmin)/sqrt(n()),1),
+              Tmin_sd = round(sd(Tmin),1),
+              Tmed_mu = round(mean(Tmed),1),
+              Tmed_se = round(sd(Tmed)/sqrt(n()),1),
+              Tmed_sd = round(sd(Tmed),1),
+              T_lq = round(mean(T_lq),1),
+              T_uq = round(mean(T_uq),1),
+              Tmax_mu = round(mean(Tmax),1),
+              Tmax_sd = round(sd(Tmax),1),
+              Tmax_se = round(sd(Tmax)/sqrt(n()),1)) 
+
+p_depth <- ggplot(md, aes(x =Month))+
+  geom_boxplot(aes(middle = Dmed_mu, upper = D_uq, lower = D_lq,
+                   ymax = Dmax_mu, ymin = Dmin_mu), stat = "identity",
+                fill = "turquoise4", alpha = 0.5)+
+  labs(x = "", y = "Depth [m]")+
+  scale_y_reverse()+
+  theme_bw()
+
+p_temp <- ggplot(md, aes(x =Month))+
+  geom_boxplot(aes(middle = Tmed_mu, upper = T_uq, lower = T_lq,
+                   ymax = Tmax_mu, ymin = Tmin_mu), stat = "identity", size = 0.5,
+                fill = "turquoise4", alpha = 0.5)+
+  labs(x = "", y = "Temperature [\u00B0C]")+
+  theme_bw()
+
+p <- (p_depth/p_temp)+ plot_annotation(tag_levels = 'A')
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig5_boxplot_DTuse.png"), width = 12, height = 15, units = "cm")
+p
+```
+
+### TAD
+
+Figure S7: Time-at-depth histograms for each month of tag attachment. Bars represent mean percentage of time (summarised by date  ) spent across individuals in each of the twelve defined depth ranges, with error bars indicating standard errors. Number of sharks contributing to each monthly plot are indicated.
+
+```{r}
+# TAD - monthly averages of daily distribution of time spent per depth bin per month, error bars mark standard error
+TAD <- mdata %>% 
+      mutate(Month = factor(lubridate::month(Date, label = T, abbr = F), 
+                            levels = c("November","December","January","February",
+                                       "March","April","May","June", "July", 
+                                       "August","September","October"))) %>% 
+      mutate(depth_bin = cut(Depth_median,breaks=c(0, 10,25,50,75,100,150,200,300,400,500,600,700), include.lowest = T)) %>%       group_by(Date) %>% 
+      mutate(n_min = n()) %>%  # minutes available per day
+      ungroup() %>% 
+      group_by(Date, depth_bin, Month) %>% #sharkID - not per ind as we are not interested in the interind. dif at this stage, no major differences 
+      reframe(TADperc = (n()/mean(n_min))*100) %>%  # count minutes in each bin per day and divide by available minutes per day 
+      ungroup() %>% 
+      # ensure that that non-occupied depth bins are zero (instead of absent)
+      pivot_wider(names_from = depth_bin, values_from = TADperc) %>% 
+      mutate(across(-Month, ~ replace_na(.,0))) %>% 
+      pivot_longer(!c(Date,Month), names_to = "depth_bin", values_to = "TADperc") %>% 
+      mutate(depth_bin = factor(depth_bin, levels = c("(600,700]","(500,600]","(400,500]","(300,400]",
+                                                      "(200,300]","(150,200]","(100,150]","(75,100]",
+                                                      "(50,75]","(25,50]","(10,25]","[0,10]"))) %>% 
+      # calculate mean and se per depth bin (aggregate over dates)
+      group_by(Month, depth_bin) %>%
+      reframe(mean = mean(TADperc),
+              se = sd(TADperc)/sqrt(n())) # standard error, if there is only one value will return NA
+              
+
+TAD2 <- mdata %>%
+      mutate(Month = factor(lubridate::month(Date, label = T, abbr = F), 
+                            levels = c("November","December","January","February",
+                                       "March","April","May","June", "July", 
+                                       "August","September","October"))) %>% 
+      mutate(depth_bin = cut(Depth_median,breaks=c(0,10,200,700), include.lowest = T)) %>% 
+      mutate(depth_bin = fct_rev(depth_bin)) %>% 
+      group_by(Date) %>% 
+      mutate(n_min = n()) %>%  # minutes available per day
+      ungroup() %>% 
+      group_by(Date, depth_bin, Month) %>% #sharkID - not per ind as we are not interested in the interind. dif at this stage, no major differences 
+      reframe(TADperc = (n()/mean(n_min))*100) %>%  # count minutes in each bin per day and divide by available minutes per day 
+      ungroup() %>% 
+      # ensure that that non-occupied depth bins are zero (instead of absent)
+      pivot_wider(names_from = depth_bin, values_from = TADperc) %>% 
+      mutate(across(-Month, ~ replace_na(.,0))) %>% 
+      pivot_longer(!c(Date,Month), names_to = "depth_bin", values_to = "TADperc") %>% 
+            # calculate mean and se per depth bin (aggregate over dates)
+      group_by(Month, depth_bin) %>%
+      reframe(mean = mean(TADperc),
+              se = sd(TADperc)/sqrt(n())) # standard error, if there is only one value will return NA
+TAD2 %>% filter(depth_bin == "(200,700]")
+TAD2 %>% filter(depth_bin == "[0,10]")
+n <- ddata %>% mutate(Month = factor(month(Date), levels = c(11:12,1:10))) %>% group_by(Month) %>% reframe(n = length(unique(sharkID)))
+
+ggplot(data = TAD, 
+       aes(y = depth_bin, x=mean, xmin = mean-se, xmax = mean+se))+
+  geom_bar(stat = "identity", fill = "turquoise4", alpha = 0.5, colour = "grey10")+
+  geom_errorbar(width = 0.2)+ # if error bar is missing - only one day per month
+  facet_wrap(~Month, labeller = stickylabeller::label_glue('{Month} (n = {n$n})'))+
+  #geom_hline(yintercept = c(11.5, 5.5), linetype = "dashed", colour = 'grey30', linewidth = 0.5)+ #"(200,250]"
+  theme_bw()+
+  labs(y = "Depth [m]", x = "Time [%]")
+
+ggsave(filename = "plots/spurdog/supplement/fig7_TAD_monthly.png", width = 12, height = 14)
+```
+
+### TAT
+
+Figure S8: Time-at-temperature histograms for each month of tag attachment. Bars represent mean percentage of time (summarised by date) spent across individuals in each of the eight defined temperature ranges, with error bars indicating standard errors. Number of sharks contributing to each monthly plot are indicated. 
+```{r}
+# TAT - monthly averages of daily distribution of time spent per temp bin per month, error bars mark standard error
+TAT <- mdata %>%
+      mutate(Month = factor(lubridate::month(Date, label = T, abbr = F),
+                            levels = c("November","December","January","February",
+                                       "March","April","May","June", "July", 
+                                       "August","September","October"))) %>% 
+      mutate(temp_bin = cut(Temp_median,breaks=seq(4,20,2), include.lowest = T)) %>% 
+      group_by(Date) %>% 
+      mutate(n_min = n()) %>%  # minutes available per day
+      ungroup() %>% 
+      group_by(Date, temp_bin, Month) %>% #sharkID - not per ind as we are not interested in the interind. dif at this stage, no major differences (just in july- more time at 6-8°C)
+      reframe(TATperc = (n()/mean(n_min))*100) %>%  # count minutes in each bin per day and divide by available minutes per day 
+      ungroup() %>% 
+      # ensure that that non-occupied depth bins are zero (instead of absent)
+      pivot_wider(names_from = temp_bin, values_from = TATperc) %>% 
+      mutate(across(-Month, ~ replace_na(.,0))) %>% 
+      pivot_longer(!c(Date,Month), names_to = "temp_bin", values_to = "TATperc") %>% 
+      mutate(temp_bin = factor(temp_bin, levels = c("[4,6]","(6,8]","(8,10]","(10,12]","(12,14]",
+                                                      "(14,16]","(16,18]","(18,20]"))) %>% 
+      # calculate mean and se per depth bin (aggregate over dates)
+      group_by(Month, temp_bin) %>%  # mean and se per month based on daily summaries
+      reframe(mean = mean(TATperc),
+              se = sd(TATperc)/sqrt(n())) # standard error, if there is only one value will return NA
+
+ggplot(data = TAT, 
+       aes(y = temp_bin, x=mean, xmin = mean-se, xmax = mean+se))+
+  geom_bar(stat = "identity",  fill = "turquoise4", alpha = 0.5, colour = "grey10")+
+  geom_errorbar(width = 0.2)+ # if error bar is missing - only one day per month
+  facet_wrap(~Month, labeller = stickylabeller::label_glue('{Month} (n = {n$n})'))+
+  theme_bw()+
+  labs(y = "Temperature [\u00B0C]", x = "Time [%]")
+ggsave(filename = "plots/spurdog/supplement/fig5_TAT_monthly.png", width = 12, height = 8)
+```
+
+# Realised vs. available DT niche
+
+## Overall - Weighted by yday
+
+Figure 1: Depth-temperature niche for 19 female spurdogs. Red colours denote the density of hourly data points (n=110,360) within a given grid cell weighted by the reciprocal of data points per Julian day. Black dotted and solid lines indicate the niche space that encompasses 50% and 95% of the points respectively. Marginal densities are shown for both covariates on the upper and right hand side. For visualisation purposes, the y-axis was limited to 400m depth.
+
+```{r}
+## Weights for track data: Ensures weighting of points per yday for shark data.
+# calculate weights as reciprocal sum of entries per julian day
+hdata_w <- hdata %>% mutate(yday = yday(Date)) %>% group_by(yday) %>% mutate(weights = 1/n()) %>% ungroup()
+dens <- kde2d.weighted(hdata_w$Depth_median, hdata_w$Temp_median, hdata_w$weights, n = 150)
+dfdens <- data.frame(expand.grid(x=dens$x, y=dens$y), z=as.vector(dens$z))
+
+## PLOT
+# over all months
+p2 <- ggplot() +
+   geom_point(data = hdata_w, aes(y = Temp_median, x = Depth_median), colour = "white")+
+   geom_tile(data = dfdens, aes(y = y, x = x, fill = z))+#after_stat(density)
+
+  # 50% contour line
+  geom_contour(data = dfdens,aes(x=x, y=y, z=z), colour = "black", lty = "dotted",
+    breaks = density_quantiles_w(x = hdata_w$Depth_median, y = hdata_w$Temp_median, w = hdata_w$weights, quantiles = c(0.5))) + 
+  # 95% contour line
+  geom_contour(data = dfdens, aes(x=x, y=y, z=z), colour = "black", lty = "solid",
+    breaks = density_quantiles_w(x = hdata_w$Depth_median, y = hdata_w$Temp_median, w = hdata_w$weights, quantiles = c(0.95))) +
+  
+  scale_x_reverse()+
+  scale_y_continuous(breaks=seq(6,18,2), labels=seq(6,18,2))+
+  scale_fill_gradientn("density", colors = c("#fefaecff","#FECC8FFF",
+                                             "#FEB37BFF","#FD9A6AFF","#FA815FFF","#F4685CFF",
+                                             "#E85362FF","#c83158ff","#bc004cff","#ab114fff"),
+                       guide = guide_colorbar(frame.colour = "black", ticks.colour = "black", title.vjust=0.8),
+                       breaks = c(0.002,0.004), labels = c(0.002,0.004))+
+  labs(x = "Depth [m]", y = "Temperature [\u00B0C]")+ 
+  coord_flip(xlim = c(400,0))+
+  theme_classic()+
+  theme(aspect.ratio = 1, legend.position = "bottom", legend.box = "horizontal",
+        legend.direction = "horizontal")
+
+p3 <- ggExtra::ggMarginal(p2, type = "density") # if expand c(0,0) above marginal densities do not match - open issue
+p3
+ggsave(plot = p3, filename = "plots/spurdog/paper/fig1_DTniche.png", width = 15, height = 15, units = "cm")
+
+```
+
+## By month w station profiles 
+
+Figure S6: Realised depth-temperature niche by female spurdogs in the context of available habitat for each month. Number of sharks contributing to each monthly plot are indicated. Red colours denote the density of hourly datapoints within a given grid cell. Black dotted and solid lines indicate the niche space that encompasses 50% and 95% of these data, respectively. The profiles in blue are CTD profiles from the hydrographic station H2 in Hardangerfjord with the mean and corresponding standard errors shown for every meter down to 250m in the given month. For visualisation purposes, the y-axis was limited to 400 m depth.
+
+```{r}
+H2_m <- H2 %>% 
+  group_by(Month, Depth) %>% 
+  reframe(Temp_mean = mean(Temp), 
+          Temp_sd = sd(Temp),
+          Temp_se = sd(Temp)/(sqrt(n())))
+
+hdata <- hdata %>% mutate(Month = factor(lubridate::month(Date, label = T, abbr = F),
+                            levels = c("November","December","January","February","March",
+                                       "April","May","June", "July","August","September","October")))
+p1 <- ggplot() +
+  # add density raster
+  stat_density2d(data = hdata, aes(y = Temp_median, x = Depth_median, fill = after_stat(density)),
+    alpha = 1,
+    geom = "raster",
+    contour = F) +
+  geom_line(data = H2_m,aes(x = Depth, y = Temp_mean),alpha = 0.8,colour = "steelblue3")+
+  geom_ribbon(data = H2_m, aes(x = Depth, y = Temp_mean, ymin = Temp_mean- Temp_se, ymax = Temp_mean + Temp_se),
+              alpha = 0.25,fill= "steelblue3") +
+  # 50% contour line
+  geom_density2d(data = hdata, aes(y = Temp_median, x = Depth_median),
+    contour_var = "density",alpha = 1,colour = "black", lty = "dotted",
+    breaks = density_quantiles(hdata$Temp_median, hdata$Depth_median, c(0.5))) +
+
+  # 95% contour line
+  geom_density2d(data = hdata, aes(y = Temp_median, x = Depth_median),
+    contour_var = "density",alpha = 1,colour = "black", lty = "solid",
+    breaks = density_quantiles(hdata$Temp_median, hdata$Depth_median, c(0.95))) +
+  scale_x_reverse(expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0), breaks =seq(6,18,2), labels =seq(6,18,2))+
+  scale_fill_gradientn("density", colors = c("#fefaecff","#FECC8FFF","#FEB37BFF", "#FD9A6AFF",
+                                              "#FA815FFF","#F4685CFF","#E85362FF",
+                                              "#c83158ff","#bc004cff","#ab114fff"), 
+                        guide = guide_colorbar(frame.colour = "black", ticks.colour = "black", vjust = 1.5),
+                        breaks = c(0.02,0.04,0.06), labels = c(0.02,0.04,0.06))+
+  facet_wrap(~Month, labeller = stickylabeller::label_glue('{Month} (n = {n$n})'), nrow = 4)+
+  labs(x = "Depth [m]", y = "Temperature [\u00B0C]")+ 
+  coord_flip(xlim = c(400,0))+
+  theme_bw()+
+  theme(legend.position = "bottom", 
+        legend.box = "horizontal",legend.direction = "horizontal")
+
+ggsave(plot = p1, filename = "plots/spurdog/supplement/fig6_DTniche_bymonth_wH2.png", width = 20, height = 28, units = "cm")
+p1
+
+```
+
+# Periodicity in depth use
+
+## Global periodogramme
+
+Similar to a fast fourier transformation the wavelet power can be averaged across time to obtain the overall or 'global' power spectrum across the tracking time series. 
+
+Figure 3C: Global, scale-averaged periodogram indicating the overall wavelet power for each shark averaged for the entire deployment period. Only significant (p ≤0.05) powers are shown without transparency.
+
+```{r}
+ggplot(data = wtavg %>% mutate(sigcol = factor(case_when(pw_avg_sig > 0.05 ~ ">0.05",
+                                                  pw_avg_sig > 0.01 & pw_avg_sig <= 0.05 ~ ">0.01,<=0.5",
+                                                  pw_avg_sig <= 0.01  ~ "<=0.01"), levels= c(">0.05", ">0.01,<=0.5","<=0.01")),
+                                 cohort = case_when(
+    tagID %in% c("17P0023", "17P0749", "17P0796", "17P0864", "17P0866") ~ "2019",
+    tagID %in% c("20P2042", "20P2044", "20P2045", "20P2046", "20P2047") ~ "2020",
+    tagID %in% c("20P2660", "21P0036", "21P0037", "21P0038", "21P0039") ~ "2021",
+    tagID %in% c("21P2088", "21P2202", "21P2203", "21P2209") ~ "2022")))+
+  geom_line(aes(x = period, y = pw_avg, group = tagID, col = cohort , alpha = sigcol))+
+  scale_x_continuous(trans="log2", breaks = c(0.5,1,7,14,28,56), expand = c(0,0))+
+  scale_colour_manual("p-value", values = c("#34a2e5ff","#5fb667ff", "#feb55dff","#cd0e5bff"))+
+  labs(x = "period [days]", y ="avg. wavelet power")+
+  theme_bw()+
+  theme(legend.position = "none")  
+ggsave(filename = paste0("plots/spurdog/paper/fig3_avgwaveletpower.png"), width = 18, height = 10, units = "cm")
+```
+
+All individuals have significant wavelet power at a period of 1d, 17/19 at 0.5d and 15/19 at 128d.
+```{r}
+wtavg %>% filter(period == 0.5 & pw_avg_sig <=0.05) %>% nrow()
+wtavg %>% filter(period == 1 & pw_avg_sig <=0.05) %>% nrow()
+
+wtavg %>% filter(period > 13 & period < 15 & pw_avg_sig <=0.05) %>% nrow()
+wtavg %>% filter(period > 26 & period < 30 & pw_avg_sig <=0.05) %>% nrow()
+t <- wtavg %>% filter(period > 84 & pw_avg_sig <=0.05)
+length(unique(t$tagID))
+tags[which(! tags %in% unique(t$tagID))] # tags which have no sig period above 84 d
+```
+
+## Simmulations
+
+To test the effect of a deviation from a sine-signal in the depth time series (e.g. due to rapid descents and ascents or different light-induced dive regimes) on the power distribution of the continuous wavelet analysis, we perform a wavelet analysis on a simulated strict diel vertical pattern for 180 days switching from 80 to 200 m depth in a 12:12, 6:18 and 3:21 h rhythm. The 12:12h pattern represents conditions during equinox while 3:21 corresponds to a light regime during solstice in the study region. 
+
+Results visualised as scalograms reveal that powers other than the 1-day period can be significant even if only a 1-day pattern is simulated. This is particularly the case for patterns that deviate most from a sine curve, such as 18:6 and 21:3h patterns. In case of the 6:18h pattern, the first harmonic at 12h is significant across the timeseries. In case of the 3:21h pattern this is the case for the 12h and higher periods. The 12:12h pattern is not associated with significant periods at 12h, and only occasionally shows significant 6h periods. 
+
+Figure S19: Scalograms obtained from a continuous wavelet analysis with equivalent parameters as used in the main analysis on three synthetic hourly depth time series for fictive 180 days mimicking simplified strict diel vertical movement patterns, alternating between 80 and 200 m depth. Scalogram resulting (A) from a 12:12h pattern, comparable to situations during equinox, (B) from a 6:18h pattern, and (C) from a 3:21h pattern, comparable to day-night patterns during solstice in the study area.
+```{r}
+# Synthethic timeseries mimicing DVM
+depth1 <- rep(c(rep(80,12), rep(200,12)),180)
+depth2 <- rep(c(rep(80,6), rep(200,18)),180)
+depth3 <- rep(c(rep(80,3), rep(200,21)),180)
+
+p1 <- ggplot(data = tibble(d = depth1[7:57], t = 1:51))+
+  geom_line(aes(x = t, y= d))+
+  scale_x_continuous(breaks = c(0,12,24,36,48))+
+  scale_y_reverse()+
+  theme_classic()+
+  labs(x= "Time [hours]",y = "Depth [m]", title = "12:12 DVM")
+
+p2 <- ggplot(data = tibble(d = depth2[7:57], t = 1:51))+
+  geom_line(aes(x = t, y= d))+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = c(0,12,24,36,48))+
+  theme_classic()+
+  labs(x= "Time [hours]",y = "", title = "6:18 DVM")
+
+p3 <- ggplot(data = tibble(d = depth3[7:57], t = 1:51))+
+  geom_line(aes(x = t, y= d))+
+  scale_x_continuous(breaks = c(0,12,24,36,48))+
+  scale_y_reverse()+
+  theme_classic()+
+  labs(x= "Time [hours]",y = "", title = "3:21 DVM")
+
+p <- (p1|p2|p3)+ plot_annotation(tag_levels = 'A')
+ggsave(filename = paste0("plots/spurdog/supplement/fig19_SyntheticTS_12-12_6-18h_3-21h.png"), width = 25, height = 8, units = "cm")
+p
+
+```
+
+```{r}
+# scalograms
+datetime <- hdata %>% filter(sharkID == 15) %>% pull(DateTime)
+df1 <- bind_cols(depth = depth1, date = datetime[1:length(depth1)])
+df2 <- bind_cols(depth = depth2, date = datetime[1:length(depth2)])
+df3 <- bind_cols(depth = depth3, date = datetime[1:length(depth3)])
+
+wt1 <- WaveletComp::analyze.wavelet(my.data = df1,
+                                    my.series = "depth",
+                                    loess.span = 0, # no detrending
+                                    dt = 1/24, # every hour
+                                    dj = 1/24, #  "resolution" (no of suboctaves) - should correspond with col n.levels
+                                    lowerPeriod = 1/4, # 6 h,
+                                    upperPeriod = 2^7, # 128 d
+                                    method = "AR",
+                                    params = list(p = 0.5),
+                                    n.sim = 100)
+
+pw1 <- plot.wavelet(wt1, ts = df1 %>% pull(date), plevel= 0.05) +  theme(legend.position = "none")  
+
+wt2 <- WaveletComp::analyze.wavelet(my.data = df2,
+                                    my.series = "depth",
+                                    loess.span = 0, # no detrending
+                                    dt = 1/24, # every hour
+                                    dj = 1/24, #  "resolution" (no of suboctaves) - should correspond with col n.levels
+                                    lowerPeriod = 1/4, # 6 h,
+                                    upperPeriod = 2^7, # 128 d
+                                    method = "AR",
+                                    params = list(p = 0.5),
+                                    n.sim = 100)
+pw2 <- plot.wavelet(wt2, ts = df2 %>% pull(date), plevel= 0.05) + theme(legend.position = "none")  
+
+wt3 <- WaveletComp::analyze.wavelet(my.data = df3,
+                                    my.series = "depth",
+                                    loess.span = 0, # no detrending
+                                    dt = 1/24, # every hour
+                                    dj = 1/24, #  "resolution" (no of suboctaves) - should correspond with col n.levels
+                                    lowerPeriod = 1/4, # 6 h,
+                                    upperPeriod = 2^7, # 128 d
+                                    method = "AR",
+                                    params = list(p = 0.5),
+                                    n.sim = 100)
+pw3 <- plot.wavelet(wt3, ts = df3 %>% pull(date), plevel= 0.05)
+
+pp <- (pw1|pw2|pw3)
+
+ggsave(pp, filename = paste0("plots/spurdog/supplement/fig19_SyntheticDVM_12-12_6-18h_3-21h.png"), width = 30, height = 8, units = "cm")
+pp
+```
+
+## Scalogrammes
+
+Periodicity per individual & time resolved
+
+### Plots
+
+Figure 2: Exemplary hourly median depth timeseries (A) and corresponding wavelet scalogramme (B). In B significant wavelet powers (p ≤0.05) are highlighted with grey contours. In A the upper bar indicates the presence (dark grey) or absence (light grey) of Diel Vertical Migration (DVM) behaviour, based on significance (p ≤0.05) of wavelet powers at 24 h.
+
+```{r}
+# Figure 2 - DT and scalogramme for selected sharks
+p2 <- plot.DTseries(data = hdata %>% filter(sharkID == 2), legend = T, ylims = c(450,-50))/ 
+      plot.wavelet(wt = wt$wavelet[[2]], ts = hdata %>% filter(sharkID == 2) %>% pull(DateTime), 
+                   plevel = 0.05, legend = T)+
+      theme(plot.margin=unit(c(-1,-1,-1,-1), 'cm'))+ #top, right, bottom, left
+      plot_annotation(title = "Shark 2", tag_levels = 'A')
+
+p10 <- plot.DTseries(data = hdata %>% filter(sharkID == 10), legend = T, ylims = c(450,-50))/ 
+      plot.wavelet(wt = wt$wavelet[[10]], ts =  hdata %>% filter(sharkID == 10) %>% pull(DateTime), 
+                   plevel = 0.05, legend = T)+
+      theme(plot.margin=unit(c(-1,-1,-1,-1), 'cm'))+ #top, right, bottom, left
+      plot_annotation(title = "Shark 10", tag_levels = 'A')
+
+p15 <- plot.DTseries(data = hdata %>% filter(sharkID == 15), legend = T, ylims = c(450,-50))/ 
+      plot.wavelet(wt = wt$wavelet[[15]], ts =  hdata %>% filter(sharkID == 15) %>% pull(DateTime), 
+                   plevel = 0.05, legend = T)+
+      theme(plot.margin=unit(c(-1,-1,-1,-1), 'cm'))+ #top, right, bottom, left
+      plot_annotation(title = "Shark 15", tag_levels = 'A')
+
+p19 <- plot.DTseries(data = hdata %>% filter(sharkID == 19), legend = T, ylims = c(450,-50))/ 
+      plot.wavelet(wt = wt$wavelet[[19]], ts =  hdata %>% filter(sharkID == 19) %>% pull(DateTime), 
+                   plevel = 0.05, legend = T)+
+      theme(plot.margin=unit(c(-1,-1,-1,-1), 'cm'))+ #top, right, bottom, left
+      plot_annotation(title = "Shark 19", tag_levels = 'A')
+
+# plot composite plot
+p <- (wrap_elements(p2)+wrap_elements(p10)+wrap_elements(p15)+wrap_elements(p19))+ plot_layout(ncol = 2)
+ggsave(p,filename = "plots/spurdog/paper/fig2_DT_Scalogramme_2_10_15_19.png", width = 30, height = 35, units = "cm") # issue of different width if one is plotted without legend
+p
+```
+
+Figure S9: Vertical habitat use across deployment period for each shark. (A) Hourly median depth timeseries and with colour coded temperatures. The upper bar indicates the presence (dark grey) or absence (light grey) of diel vertical migration (DVM) behaviour, based on significance (p ≤0.05) of wavelet powers at 24 h. (B) Wavelet scalogramme based on median hourly depth. Significant powers (p≤0.05) are highlighted with grey contours. (C-G) Actograms for 1-minute interval median depth (C), temperature (D), and light level (E) use, hourly vertical speed (E), and hourly cumulated fast starts (F) across the time of day. In (D) red colours mark descents, while blue colours represent ascents. Solid lines indicate times of sunrise and sunset, dashed lines nautical dusk and dawn associated with the tagging location. Note the different date ranges between sharks on the x-axis.
+
+```{r}
+# Figure S9 - DT series, wavelet scalogramme, track, depth, temp, light and actogramme per shark
+for(s in sharks){ 
+  wt_s <- wt$wavelet[[s]]
+  # DT plot
+  p1 <- plot.DTseries(data = hdata %>% filter(sharkID == s), DVMbar = T)
+  # WT scalogramme
+  p2 <- plot.wavelet(wt_s, ts =  hdata %>% filter(sharkID == s) %>% pull(DateTime), plevel = 0.05)
+  
+  # for minutely data (depth, temp, light)
+  mdata_s <- mdata %>% filter(sharkID == s) %>% 
+       # obtain times in hour minute second for Date and suntimes
+       mutate(Time = hms::hms(second(DateTime),minute(DateTime),hour(DateTime)),
+              sunrise = hms::hms(second(sunrise),minute(sunrise),hour(sunrise)),
+              sunset = hms::hms(second(sunset),minute(sunset),hour(sunset)),
+              nautdawn = hms::hms(second(dawn.naut),minute(dawn.naut),hour(dawn.naut)),
+              nautdusk = hms::hms(second(dusk.naut),minute(dusk.naut),hour(dusk.naut))) %>%
+       #ensure there are no beginning nights/days - avoid vertical line
+       mutate(nautdawn = replace(nautdawn, is.na(nautdusk), NA),
+              nautdusk = replace(nautdusk, is.na(nautdawn), NA),
+              sharkID = factor(paste0("Shark ",s)))
+  
+  #Depth-ogramme
+  p3 <- ggplot(data = mdata_s,
+          aes(y = Time, x = Date)) +
+    geom_tile(aes(fill=Depth_median))+
+    scale_fill_gradientn(colours =  c("#f1fbf4ff","#DEF5E5FF","#A0DFB9FF","#54C9ADFF","#38AAACFF",
+    "#348AA6FF","#366A9FFF","#40498EFF","#3B2F5EFF"), name= "Depth [m]", 
+                       guide = guide_colourbar(reverse = T, 
+                                               frame.colour = "black", 
+                                               ticks.colour = "black"), 
+                       breaks= seq(100,600,100),limits = c(0,643.5),
+                       values=c(0,0.05,0.1,0.2,0.3,0.5,0.7,1),
+                       oob = scales::squish)+
+    geom_line(aes(x = Date, y = sunrise), col = "grey20")+
+    geom_line(aes(x = Date, y = sunset), col = "grey20")+
+    geom_line(aes(x = Date, y = nautdawn), col = "grey50", linetype = "dashed")+
+    geom_line(aes(x = Date, y = nautdusk), col = "grey50", linetype = "dashed")+
+    scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0,0))+
+    scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+    labs(x = "", y = "Time of day")+
+    theme_bw()
+  
+  # Tempo-gramme
+  p4 <- ggplot(data = mdata_s,
+          aes(y = Time, x = Date)) +
+    geom_tile(aes(fill = Temp_median))+
+    scale_fill_gradientn(colors = c("#013688","#34a2e5ff","#80C586", "#FECC8FFF","#FA815FFF","#bc004cff"),
+                           values = c(0,0.25,0.4,0.6,1),breaks= seq(6,16,2), limits=c(4,17), name = "Temp [\u00B0C]",
+                           oob = scales::squish, guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"))+
+    #scale_fill_viridis(direction = 1, option = "magma",name= "Temperature [\u00B0C]")+
+    geom_line(aes(x = Date, y = sunrise), col = "grey20")+
+    geom_line(aes(x = Date, y = sunset), col = "grey20")+
+    geom_line(aes(x = Date, y = nautdawn), col = "grey50", linetype = "dashed")+
+    geom_line(aes(x = Date, y = nautdusk), col = "grey50", linetype = "dashed")+
+    scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0,0))+
+    scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+    labs(x = "", y = "Time of day", colour = "Temp [\u00B0C]")+
+    theme_bw()
+
+  # Lighto-gramme
+  p5 <- ggplot(data = mdata_s,
+          aes(y = Time, x = Date)) +
+    geom_tile(aes(fill=Lightlevel_median))+
+    scale_fill_viridis(direction = 1, option = "cividis",name = "Light level", #trans = "log10",
+                      # values = c(0,0.5,0.75,0.875,0.9375, 0.96875, 0.984375, 1), 
+                       limits=c(20,225), 
+                       oob = scales::squish, guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"))+
+    geom_line(aes(x = Date, y = sunrise), col = "white")+
+    geom_line(aes(x = Date, y = sunset), col = "white")+
+    geom_line(aes(x = Date, y = nautdawn), col = "grey90", linetype = "dashed")+
+    geom_line(aes(x = Date, y = nautdusk), col = "grey90", linetype = "dashed")+
+    scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0,0))+
+    scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+    labs(x = "", y = "Time of day")+
+    theme_bw()
+  
+  # for hourly data (vertical speed, fast starts)
+  hdata_s <- hdata %>% filter(sharkID == s) %>% 
+       # obtain times in hour minute second for Date and suntimes
+       mutate(Time = hms::hms(second(DateTime),minute(DateTime),hour(DateTime)),
+              sunrise = hms::hms(second(sunrise),minute(sunrise),hour(sunrise)),
+              sunset = hms::hms(second(sunset),minute(sunset),hour(sunset)),
+              nautdawn = hms::hms(second(dawn.naut),minute(dawn.naut),hour(dawn.naut)),
+              nautdusk = hms::hms(second(dusk.naut),minute(dusk.naut),hour(dusk.naut))) %>%
+       #ensure there are no beginning nights/days - avoid vertical line
+       mutate(nautdawn = replace(nautdawn, is.na(nautdusk), NA),
+              nautdusk = replace(nautdusk, is.na(nautdawn), NA),
+              sharkID = factor(paste0("Shark ",s)))
+  # Actogramme - Vertical speed  
+  p6 <-ggplot(data = hdata_s)+
+  geom_tile(aes(y=Time, x=Date, fill=Vertical_speed_mean))+
+  scale_fill_gradient2(low = "indianred3", mid = "white", high = "royalblue2", name= "Speed [m/s]", 
+                       limits = c(-0.12,0.12), guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"))+
+  scale_x_date(date_breaks = "1 month",date_labels = "%b", expand = c(0,0),)+
+  scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  geom_line(aes(x = Date, y = sunrise), col = "grey20")+
+  geom_line(aes(x = Date, y = sunset), col = "grey20")+
+  geom_line(aes(x = Date, y = nautdawn), col = "grey50", linetype = "dashed")+
+  geom_line(aes(x = Date, y = nautdusk), col = "grey50", linetype = "dashed")+
+  labs(x = "", y = "Time of day")+
+  theme_bw()
+  
+  #Actogramme - Fast starts
+  p7 <- ggplot(data = hdata_s)+
+  geom_tile(aes(y=Time, x=Date, fill=FS95_cum))+
+  scale_fill_gradientn(colors = c("#fef4dcff", "#FDE4A6FF","#FECC8FFF","#FEB37BFF","#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF","#c83158ff","#bc004cff","#ab114fff"), 
+  breaks= seq(100,700,100),limits = c(0,719),values = c(0,0.2,0.4,0.6,1), 
+  name = "Fast Starts",oob = scales::squish,
+  guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"))+
+  scale_x_date(date_breaks = "1 month",date_labels = "%b", expand = c(0,0))+
+  scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  geom_line(aes(x = Date, y = sunrise), col = "black")+
+  geom_line(aes(x = Date, y = sunset), col = "black")+
+  geom_line(aes(x = Date, y = nautdawn), col = "grey10", linetype = "dashed")+
+  geom_line(aes(x = Date, y = nautdusk), col = "grey10", linetype = "dashed")+
+  labs(x="", y = "Time of day")+
+  theme_bw()
+  # plot composite plot
+  p <- (p1/p2/p3/p4/p5/p6/p7) + plot_annotation(title = paste0("Shark ",s), tag_levels = 'A')
+  # save plot
+  ggsave(p, filename = paste0("plots/spurdog/supplement/fig9_DT_WT_Acto_", s,".png"), width = 20, height = 60, units = "cm")
+}
+```
+
+### DVM Summary
+
+Figure 3A & B:
+Individual differences in DVM behaviour across a year. Colours indicate tagging years (2019-blue, 2020-green, 2021-yellow, 2022-red).  (A) Overall proportion of DVM behaviour displayed on a given Julian day based on B. (B) Occurrence of significant DVM behaviour for each shark by Julian day. Dark bands denote days identified as showing predominantly significant DVM behaviour (based on significant 24h period in wavelet power), while light bands refer to days at which this is not the case. Coloured vertical lines present the Julian day of tagging. Data gaps due to different deployment durations are shown in white
+
+```{r}
+t <- ddata %>% mutate(yday= yday(Date), 
+                      DVM = as.numeric(DVM == "DVM"), 
+                      sharkID = fct_rev(sharkID)) %>% dplyr::select(yday, sharkID, DVM, cohort) #%>%  pivot_wider(names_from = yday, values_from = DVM)
+
+# fig 3A
+p1 <- ggplot(t, aes(x= yday, y= sharkID))+
+  geom_tile(aes(fill = cohort),alpha = 0.5)+
+  scale_fill_manual(values = c("#34a2e5ff","#5fb667ff", "#feb55dff","#cd0e5bff"), guide ="none")+
+  ggnewscale::new_scale_fill() +
+  geom_tile(aes(fill = DVM),alpha = 0.7)+
+  scale_fill_gradientn(colors = c("white","grey30"), guide ="none")+
+  geom_hline(yintercept = seq(1.5,19.5,1), colour = "white", linetype = "solid")+
+  geom_vline(xintercept = c(32,60, 91, 182,121,152,213, 244,274, 305, 335), colour = "black",alpha = 0.5, linetype = "dotted", linewidth = 0.5)+
+  geom_segment(x = yday("2022-10-25"), xend = yday("2022-10-25"),y = 0.5, yend=4.5, colour = "#cd0e5bff", linewidth = 0.7, linetype = "solid")+
+  geom_segment(x = yday("2021-11-04"), xend = yday("2021-11-04"),y = 4.5, yend=9.5 , colour =  "#feb55dff",linewidth = 0.7, linetype = "solid")+
+  geom_segment(x = yday("2020-12-10"), xend = yday("2020-12-10"),y = 9.5, yend=14.5, colour = "#5fb667ff",linewidth = 0.7, linetype = "solid")+
+  geom_segment(x = yday("2019-11-26"), xend = yday("2019-11-26"),  y = 14.5, yend=19.5, colour = "#34a2e5ff",linewidth = 0.7, linetype = "solid")+
+  scale_x_continuous(expand = c(0,0), breaks = c(32,60,91,121,152,182,213,244,274,305,335,366), labels= c("Jan", "Feb","Mar","Apr","May","Jun", "Jul", "Aug","Sep","Oct","Nov", "Dec"))+
+  scale_y_discrete(expand = c(0,0))+
+  labs(x= "", y = "Shark", fill = "DVM")+
+  theme_classic()+
+  theme(axis.text.x = element_text(hjust = 1.5))
+ggsave(p1, filename = paste0("plots/spurdog/paper/DVM_tiles_cohort.png"), width = 14, height = 10, units = "cm")
+
+# overall prop of DVM displayed
+t_count <- t %>% group_by(yday) %>% summarise(dens = sum(DVM)/n())
+p1a <- ggplot(t_count, aes(x= yday, y= dens))+
+  geom_line()+
+  labs(x= "", y = "Prop. DVM")+
+  scale_y_continuous(expand = c(0,0))+
+  geom_hline(yintercept = seq(0,1),  colour = "black",alpha = 0.5, linetype = "dotted", linewidth = 0.5)+
+  scale_x_continuous(expand = c(0,0), breaks = c(32,60,91,121,152,182,213,244,274,305,335,366), labels= c("Jan", "Feb","Mar","Apr","May","Jun", "Jul", "Aug","Sep","Oct","Nov", "Dec"))+
+  theme_classic()+
+  theme(axis.text.x = element_text(hjust = 1.5))
+
+layout <- "\nA\nB\nB\nB\nB\nB\n"
+p <- (p1a/p1) + plot_layout(design = layout)
+ggsave(p, filename = paste0("plots/spurdog/paper/fig3_DVM_tiles_cohort_propDVM.png"), width = 14, height = 14, units = "cm")
+p
+```
+
+## Cluster analysis
+
+Figure 3D: Dendrogramme indicating the dissimilarity between individuals based on Euclidean distance of p-values for the 24h-period.
+
+```{r}
+#cluster analysis based on significance level for 24h period power (wavelet) & averaged per day and with a centred rolling mean with a 11 day window
+d <- hdata %>% group_by(sharkID,Date) %>% 
+  summarise(power =mean(power24_sig)) %>% 
+  mutate(power = zoo::rollmean(x = power, k = 11, align = "center", na.pad = T),yday = yday(Date)) %>% 
+  dplyr::select(sharkID, yday, power) %>% 
+  pivot_wider(names_from = yday, values_from = power)
+mat <- as.matrix(d[,2:367]) # since df is organised by tagIDs
+rownames(mat) <- sharks
+
+dist<- factoextra::get_dist(mat, method= "euclidian") # calculate distance matrix
+#fviz_dist(dist)
+hclust <- hclust(dist, method = "ward.D2") # calculate clusters
+factoextra::fviz_dend(hclust) # visualise dendrogramme
+
+c1 <- "#34a2e5ff"
+c2 <- "#5fb667ff"
+c3 <- "#feb55dff"
+c4 <- "#cd0e5bff"
+
+p2 <-factoextra::fviz_dend(hclust, k = NULL, rect = T, lower_rect = 100, rect_fill = T, 
+                        color_labels_by_k = F, scale = "none", guides = "none",
+                        label_cols = c(rep(c3,4),rep(c1,3), c2,c2,c3,c1,c1,c2,c4,c2,rep(c4,2),c2,c4),
+                        labels_track_height = 1, horiz = F, cex = 0.55, main = "", sub = "",ylab = "Dissimilarity", ggtheme = theme_minimal())
+p2$layers[[2]]$data$hjust <- rep(0.5,19)
+p2$layers[[2]]$data$vjust <- rep(1.5,19)
+p2$layers[[2]]$data$angle <- rep(0,19)
+p2
+ggsave(p2, filename = paste0("plots/spurdog/paper/fig3_dendrogramme_DVM_cluster.png"), width = 8, height = 5, units = "cm")
+```
+
+## DVM & possible strategies
+
+DVM - Feeding behaviour or thermoregulation? Other behaviours such as breeding or migration rather unlikely.
+
+Figure 4: Evidence for normal diel vertical migration (DVM) behaviour during as significant classified DVM. Normal DVM is indicated by (A) deeper depth used during the day compared to night and (B) negative vertical speeds during dawn and positive speeds during dusk.(C-E) highlight depth, light level and vertical speed across the deployment for the time of day exemplary for shark 15. (A) Plot is based on 1-minute interval median depth data and boxes indicating the median and the lower and upper quartiles, whiskers are 1.5 times the interquartile range. Violine plots indicate the data range. (B) Plot is based on hourly vertical mean speeds for different daily periods, with boxes showing the mean and outliers shown. Dawn and dusk mark the time between nautical dawn and sunrise as well as dusk and sunset respectively for all sharks. Asterisks denote significance level of Wilcoxon signed rank (A) and one-sided t-test (B) (*** - p≤0.001). One minute inverval median depth and light level (C, D) and hourly mean vertical speeds (E) of shark 15 in the context of times of sunrise and sunset (solid lines) and nautical dusk and dawn (sun at 12° below horizon; dashed lines) associated with the tagging location. Light levels of 150, 110, and 70 correlate to 10-5, 10-7, and 10-9 Wcm-2 respectively (see Supplement). In (E) blue colours indicate ascends and red colours descents.
+
+### nDVM
+
+Figure 4 A,C,D: Clear indication for a normal DVM, where sharks go deep during day and shallow during night. This points towards feeding behaviour.
+
+```{r}
+# Figure 4A - Boxplot with depth differences during DVM behaviour for night and day
+
+# filter out days or nights which do not have pairs
+t1 <- mdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(Depth_median = median(Depth_median)) 
+t2 <- mdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(Depth_median = median(Depth_median)) %>% group_by(Date, sharkID) %>% summarise(n = n())
+t <- left_join(t1, t2, by = c("Date", "sharkID")) %>% filter(n == 2) %>% ungroup()
+
+# upper and lower quartile
+t %>% group_by(daynight) %>% summarise(lq = quantile(Depth_median, p=0.25), uq = quantile(Depth_median, p=0.75))
+
+# test if depth at day is shallower than depth at night
+wilcox.test(t$Depth_median ~ t$daynight,paired = TRUE, alternative = "greater")
+
+# figure 4A with statistical results
+p1 <- ggstatsplot::ggwithinstats( # paired samples
+  data = t,
+  x = daynight,
+  y = Depth_median,
+  type = "nonparametric", # for wilcoxon
+  point.args = list(alpha = 0),
+  point.path = FALSE,
+  ggtheme = theme_bw(),
+  centrality.plotting = T,
+  centrality.path = F,
+  centrality.point.args = list(alpha = 0),
+  results.subtitle =F
+)
+# median 198.5 (day) vs 60 (night)
+p1 <- p1 + scale_y_reverse() + 
+  labs(x= "", y = "Depth [m]")+ 
+  theme(plot.subtitle=element_text(size=7, hjust=0, face="italic", color="black"))+ 
+  geom_signif(comparisons = list(c("day","night")),
+              y_position = 0,
+              annotation = "***")+
+  expand_limits(y = -50)
+
+p1
+# Figure 4C - tiles plot depth shark 15
+s <- 15
+
+p2 <- ggplot(data = mdata %>% filter(sharkID ==s)%>% mutate(Time = hms::hms(second(DateTime),minute(DateTime),hour(DateTime)),
+                                                   sunrise = hms::hms(second(sunrise),minute(sunrise),hour(sunrise)), 
+                                                   sunset = hms::hms(second(sunset),minute(sunset),hour(sunset)), 
+                                                   nautdawn = hms::hms(second(dawn.naut),minute(dawn.naut),hour(dawn.naut)),
+                                                   nautdusk = hms::hms(second(dusk.naut),minute(dusk.naut),hour(dusk.naut)))%>% 
+                                            #ensure there are no beginning nights/days - avoid vertical line
+                                            mutate(nautdawn = replace(nautdawn, is.na(nautdusk), NA),
+                                                   nautdusk = replace(nautdusk, is.na(nautdawn), NA)), 
+        aes(y = Time, x = Date)) + 
+  geom_tile(aes(fill=Depth_median))+
+  scale_fill_viridis(direction = -1, option = "G",name = "Depth [m]  ", guide = guide_colourbar(reverse = T))+
+  geom_line(aes(x = Date, y = sunrise), col = "grey20")+
+  geom_line(aes(x = Date, y = sunset), col = "grey20")+
+  geom_line(aes(x = Date, y = nautdawn), col = "grey50", linetype = "dashed")+
+  geom_line(aes(x = Date, y = nautdusk), col = "grey50", linetype = "dashed")+
+  scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0,0))+
+  scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  labs(x = "", y = "Time of day [hrs]")+
+  theme_bw()
+
+# Figure 4D - tiles plot light shark 15
+p3 <- ggplot(data = mdata %>% 
+               filter(sharkID ==s)%>% 
+               mutate(Time = hms::hms(second(DateTime),minute(DateTime),hour(DateTime)),
+                                               sunrise = hms::hms(second(sunrise),minute(sunrise),hour(sunrise)), 
+                                               sunset = hms::hms(second(sunset),minute(sunset),hour(sunset)), 
+                                               nautdawn = hms::hms(second(dawn.naut),minute(dawn.naut),hour(dawn.naut)),
+                                               nautdusk = hms::hms(second(dusk.naut),minute(dusk.naut),hour(dusk.naut)))%>% 
+                                            #ensure there are no beginning nights/days - avoid vertical line
+                                            mutate(nautdawn = replace(nautdawn, is.na(nautdusk), NA),
+                                                   nautdusk = replace(nautdusk, is.na(nautdawn), NA)), 
+        aes(y = Time, x = Date)) + 
+  geom_tile(aes(fill=Lightlevel_median))+
+  scale_fill_viridis(direction = 1, option = "cividis",name= "Light level")+
+  geom_line(aes(x = Date, y = sunrise), col = "white")+
+  geom_line(aes(x = Date, y = sunset), col = "white")+
+  geom_line(aes(x = Date, y = nautdawn), col = "grey90", linetype = "dashed")+
+  geom_line(aes(x = Date, y = nautdusk), col = "grey90", linetype = "dashed")+
+  scale_x_date(date_breaks = "1 month", date_labels = "%b", expand = c(0,0))+
+  scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  labs(x = "", y = "Time of day [hrs]")+
+  theme_bw()
+```
+
+### Vertical speeds
+
+Figure 4B,E: High vertical speeds during dusk and dawn also indicate nDVM and likely feeding behaviour, as they follow the prey up or down and make use of less organised swarms.
+
+```{r}
+# hourly mean vertical speed by DVM
+p4 <- ggplot(data = hdata %>% filter(DVM == "DVM"))+ # added filter (not in saved version)
+  geom_hline(yintercept=0, linetype='dashed')+
+  geom_boxplot(aes(y = Vertical_speed_mean , x = daynightduskdawn.naut), outlier.alpha = 0.3)+
+  labs(y = "Vertical hourly mean speed [m/s]", 
+       x = "")+
+  geom_signif(aes(y = Vertical_speed_mean , x = daynightduskdawn.naut, group = daynightduskdawn.naut),
+              xmin = c(0.8, 1.8,2.8,3.8), xmax = c(1.2,2.2,3.2,4.2), 
+              y_position = c(0.07, 0.108, 0.1,0.1), 
+              annotation = c("***", "n.s.","***", "n.s."), tip_length = 0) +
+  theme_bw()+
+  expand_limits(y = 0.115)
+p4
+```
+
+Mean hourly vertical speeds at both dawn and dusk are significantly different from zero.
+```{r}
+t <- hdata %>% filter(daynightduskdawn.naut == "dusk" & DVM == "DVM")
+hist(t$Vertical_speed_mean)
+t.test(t$Vertical_speed_mean)
+
+t2 <- hdata %>% filter(daynightduskdawn.naut == "dawn"& DVM == "DVM")
+hist(t2$Vertical_speed_mean)
+t.test(t2$Vertical_speed_mean)
+
+t3 <- hdata %>% filter(daynightduskdawn.naut == "day" & DVM == "DVM")
+hist(t3$Vertical_speed_mean)
+t.test(t3$Vertical_speed_mean)
+
+t4 <- hdata %>% filter(daynightduskdawn.naut == "night" & DVM == "DVM")
+hist(t4$Vertical_speed_mean)
+t.test(t4$Vertical_speed_mean)
+```
+
+For one tag (shark 15)
+```{r}
+p5 <- ggplot(data = hdata %>% 
+               filter(sharkID ==s) %>% 
+               mutate(Time = hms::hms(second(DateTime),minute(DateTime),hour(DateTime)),
+                      sunrise = hms::hms(second(sunrise),minute(sunrise),hour(sunrise)), 
+                      sunset = hms::hms(second(sunset),minute(sunset),hour(sunset)), 
+                      nautdawn = hms::hms(second(dawn.naut),minute(dawn.naut),hour(dawn.naut)),
+                      nautdusk = hms::hms(second(dusk.naut),minute(dusk.naut),hour(dusk.naut))) %>% 
+                      #ensure there are no beginning nights/days - avoid vertical line
+               mutate(nautdawn = replace(nautdawn, is.na(nautdusk), NA),
+                      nautdusk = replace(nautdusk, is.na(nautdawn), NA)))+
+  geom_tile(aes(y=Time, x=Date, fill=Vertical_speed_mean))+
+  scale_fill_gradient2(low = "indianred3", mid = "white", high = "royalblue2", name= "Speed [m/s]")+
+  scale_x_date(date_breaks = "1 month",date_labels = "%b", expand = c(0,0))+
+  scale_y_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  geom_line(aes(x = Date, y = sunrise), col = "grey20")+
+  geom_line(aes(x = Date, y = sunset), col = "grey20")+
+  geom_line(aes(x = Date, y = nautdawn), col = "grey50", linetype = "dashed")+
+  geom_line(aes(x = Date, y = nautdusk), col = "grey50", linetype = "dashed")+
+  theme_bw()+
+  labs(x = "", y = "Time of day [hrs]")
+```
+
+### composite figure 4
+```{r}
+layout <- "\nAABBB\nAACCC\nDDEEE\n"
+p <- p1+p2+p3+p4+p5 + 
+  plot_layout(design = layout) + 
+  plot_annotation(tag_levels =list(c("A", "C", "D", "B", "E")))
+ggsave(p, filename = paste0("plots/spurdog/paper/fig4_nDVM.png"), width = 30, height = 25, units = "cm")
+```
+
+### Individal differences
+
+Figure S11: Inter-individual differences in median depth distributions for day and night during as significant classified diel vertical migration (DVM). Results from a Wilcoxon signed rank test shown for each shark. Violin plots in grey represent the full distribution of the data. Boxplots show median and lower and upper quartiles with whiskers extending to 1.5*IQR.
+
+```{r}
+t1 <- mdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(Depth_median = median(Depth_median)) 
+t2 <- mdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(Depth_median = median(Depth_median)) %>% group_by(Date, sharkID) %>% summarise(n = n())
+t <- left_join(t1, t2, by = c("Date", "sharkID")) %>% filter(n == 2) %>% ungroup()
+
+for(s in sharks){
+  ts <- t %>% filter(sharkID == s)#
+  assign(
+    paste0("p",s), 
+    ggstatsplot::ggwithinstats( # paired samples
+      data = ts,
+      x = daynight,
+      y = Depth_median,
+      type = "nonparametric", # for wilcoxon
+      boxplot.args = list(width = 0.15, fill = "turquoise4", alpha = 0.5),
+      violin.args = list(alpha = 0, colour = "grey70"),
+      point.args = list(alpha = 0),# to remove points
+      point.path = F,
+      ggtheme = theme_bw(),
+      centrality.plotting = F,
+      centrality.path = F,
+      centrality.point.args = list(alpha = 0),
+      results.subtitle =T,
+      xlab = "", 
+      ylab  = "Depth [m]",
+      title  = paste0("Shark ", s)
+    )
+  )
+}
+p1 <- p1 + scale_y_reverse()+ theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p2 <- p2 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p3 <- p3 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p4 <- p4 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p5 <- p5 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p6 <- p6 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p7 <- p7 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p8 <- p8 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p9 <- p9 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p10 <- p10 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p11 <- p11 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p12 <- p12 +  scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p13 <- p13 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p14 <- p14 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p15 <- p15 + scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p16 <- p16 +  scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p17 <- p17 +  scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p18 <- p18 +  scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p19 <- p19 +  scale_y_reverse()+theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+## combining the individual plots into a single plot
+p <- ggstatsplot::combine_plots(
+  plotlist = list(p1, p2, p3, p4, p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,p16,p17,p18,p19),
+  plotgrid.args = list(nrow = 5)
+  # annotation.args = list(title = "Individual hourly fast starts over day and night")
+)
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig11_Depth-Ind_DayNight.png"), width = 35, height = 40, units = "cm")
+
+```
+
+### Boxplots over month
+
+Figure S10: Hourly median depth used across all individuals for a given month. Medians and 25, 75% confidence intervals are shown. Number of sharks contributing to each monthly plot are indicated.
+
+```{r}
+
+n <- ddata %>% mutate(Month = factor(month(Date), levels = c(11:12,1:10))) %>% group_by(Month) %>% reframe(n = length(unique(sharkID)))
+
+ggplot(data = hdata %>% mutate(Month = factor(lubridate::month(Date, label = T, abbr = T), 
+                            levels = c("Nov","Dec","Jan","Feb","Mar","Apr","May","Jun", "Jul", "Aug","Sep","Oct"))))+
+  geom_hline(yintercept=0, linetype='dotted', colour = "grey30")+
+  geom_boxplot(aes(x = as.factor(Hour) , y = Depth_median),outlier.alpha = 0.3, fill = "turquoise4", alpha = 0.5)+
+  scale_y_reverse()+
+  labs(x = "Hour of day", y = "Depth [m]")+
+  guides(fill="none")+
+  facet_wrap(~Month, labeller = stickylabeller::label_glue('{Month}; n = {n$n}'))+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+ggsave(filename = paste0("plots/spurdog/supplement/fig10_nDVM_perMonth.png"), width = 30, height = 20, units = "cm")
+
+```
+
+### Timeseries
+
+Figure 5: Seasonal differences in depth timeseries and number of fast starts. Exemplary data shown for sharks 2, 10, 15, and 19 for a week in January (winter, left) and June (early summer, right) based on 1-minute interval median depths (left y-axis) and temperatures (as colour) as well as hourly counts of fast starts (dark grey bars, right y-axis). Grey polygons mark night defined by sunset and sunrise and nautical dusk and dawn (sun 12° below horizon, winter only) around the tagging location. Note free y-axes and the x-axis in B showing data for May and not June due to lack of data for later month.
+
+```{r}
+p2_w  <- plot.DTAseries(mdata, hdata, shark = 2, from = "01-14", to = "01-21", season = "Winter", legend = F)
+p10_w <- plot.DTAseries(mdata, hdata, shark = 10, from = "01-14", to = "01-21", season = "Winter", legend = F)
+p15_w <- plot.DTAseries(mdata, hdata, shark = 15, from = "01-14", to = "01-21", season = "Winter", legend = F)
+p19_w <- plot.DTAseries(mdata, hdata, shark = 19, from = "01-14", to = "01-21", season = "Winter", legend = F)
+
+p2_s  <- plot.DTAseries(mdata, hdata, shark = 2, from = "05-14", to = "05-21", season = "Summer")
+p10_s <- plot.DTAseries(mdata, hdata, shark = 10, from = "06-14", to = "06-21", season = "Summer")
+p15_s <- plot.DTAseries(mdata, hdata, shark = 15, from = "06-14", to = "06-21", season = "Summer")
+p19_s <- plot.DTAseries(mdata, hdata, shark = 19, from = "06-14", to = "06-21", season = "Summer") 
+
+p2  <- p2_w +p2_s + plot_annotation(title = paste0("Shark 2"))
+p10 <- p10_w +p10_s + plot_annotation(title = paste0("Shark 10"))
+p15 <- p15_w +p15_s + plot_annotation(title = paste0("Shark 15"))
+p19 <- p19_w +p19_s + plot_annotation(title = paste0("Shark 19"))
+
+# plot composite plot
+p <- wrap_elements(p2)/wrap_elements(p10)/wrap_elements(p15)/wrap_elements(p19)
+ggsave(plot = p, filename = paste0("plots/spurdog/paper/fig5_timeseries_wintersummer.png"), 
+       width = 30, height = 40, units = "cm")
+p15
+```
+
+Monthly dynamics across all individuals for depth and activity across different hours of the day to act as a base for the illustrative figure on the poster.
+```{r}
+# plots for illustrated fig on poster 
+
+# time series
+t <- mdata %>%
+  mutate(Time = format(DateTime, format = "%H:%M:%S")) %>% 
+  group_by(Time, Month) %>% summarise(D_m = median(Depth_median), D_l = quantile(Depth_median, 0.25),  D_u = quantile(Depth_median, 0.75))
+
+
+ggplot(t, aes(x= Time, y=D_m, ymin = D_u, ymax= D_l, group = Month))+
+  geom_hline(yintercept=0, linetype='dotted', colour = "grey70")+
+  geom_hline(yintercept=c(100,200), linetype='dashed', colour = "grey70")+
+  #geom_vline(xintercept=1, linetype='dotted', colour = "white")+
+  geom_errorbar(width = 0.2, colour = "grey")+
+  geom_line()+
+  scale_y_reverse()+
+  facet_wrap(~Month)+
+  #scale_x_time(breaks = scales::breaks_width("2 hours"), labels = scales::label_time("%H:%M"), expand = c(0,0))+
+  labs(y = "Depth", x = "Time of day")+ 
+  theme_bw()
+
+ggsave(filename = paste0("plots/spurdog/poster/timeseries_months.png"), 
+       width = 35, height = 20, units = "cm")
+
+# activity
+a <- mdata %>%
+  mutate(Time = format(DateTime, format = "%H:%M:%S")) %>% 
+  group_by(Hour, Month) %>% summarise(A_m = mean(FS95_cum), A_l = quantile(FS95_cum, 0.25),  A_u = quantile(FS95_cum, 0.75))
+
+ggplot(a, aes(x= Hour, y=A_m, ymin = A_l, ymax= A_u, group = Month))+
+  geom_bar(stat = "identity")+
+  geom_errorbar(width = 0.2, colour = "grey")+
+  facet_wrap(~Month)
+
+ggsave(filename = paste0("plots/spurdog/poster/activity_months.png"), 
+       width = 35, height = 20, units = "cm")
+```
+
+## Activity patterns
+
+### Vertical speed stats
+```{r}
+range(mdata$Vertical_speed_mean)
+mean(mdata$Vertical_speed_mean)
+mean(hdata$Vertical_speed_abs_mean)
+quantile(mdata$Vertical_speed_mean, probs = c(0.25,0.75))
+
+thresh <- quantile(abs(mdata$Vertical_speed_mean), probs = 0.95)
+
+t <- mdata %>% filter(abs(Vertical_speed_mean) > thresh)
+table(t$Month)
+hist(t$Month)
+table(t$daynightduskdawn.naut)
+```
+
+### FS95: DVM vs. non-DVM
+
+Figure S13: Cumulated hourly fast starts based on all individuals and time periods for DVM and non-DVM behaviour. Based on a Mann-Whitney test there are significantly more fast starts observed during DVM than during non-DVM behaviour (p= < 2.2e-16). Violin plots in grey represent the full distribution of the data. Boxplot show median and lower and upper quartiles with whiskers extending to 1.5 * IQR.
+```{r}
+#Non-normally distributed
+hist(hdata$FS95_cum)
+
+wilcox.test(hdata$FS95_cum ~ hdata$DVM, alternative = "greater")
+
+p1 <- ggstatsplot::ggbetweenstats( 
+  data = hdata,
+  x = DVM,
+  y = FS95_cum,
+  type = "nonparametric", 
+  boxplot.args = list(width = 0.1, fill = "turquoise4", alpha = 0.5),
+  violin.args = list(alpha = 0),
+  point.args = list(alpha = 0),
+  ggtheme = theme_bw(),
+  centrality.point.args = list(alpha = 0),
+)
+p1 <- p1 + labs(x= "",y = "Hourly no. fast starts")+ theme(plot.subtitle=element_text(size=7, hjust=0, face="italic", color="black"))
+p1
+
+ggsave(p1, filename = paste0("plots/spurdog/supplement/fig13_FS95_cum-DVMvsnonDVM.png"), width = 12, height = 10, units = "cm")
+```
+
+### FS95: Day vs Night
+
+Figure S14: Median hourly number of fast starts paired for each day and night per individual (A) for as significant DVM classified behaviour and (B) as non-DVM classified behaviour. A paired Wilcoxon signed rank test was performed for both cases, indicating a significantly greater number of fast starts during day (p-value < 2.2e-16, p-value = 2.689e-08). Violin plots in grey represent the full distribution of the data. Boxplot show median and lower and upper quartiles with whiskers extending to 1.5 * IQR.
+
+```{r}
+# DVM
+t1 <- hdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) 
+t2 <- hdata %>% filter(DVM == "DVM") %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) %>% group_by(Date, sharkID) %>% summarise(n = n())
+t <- left_join(t1, t2, by = c("Date", "sharkID")) %>% filter(n == 2) %>% ungroup()
+table(t$daynight)
+
+wilcox.test(t$FScum_median ~ t$daynight,paired = TRUE, alternative = "greater")
+
+p1 <- ggstatsplot::ggwithinstats( # paired samples
+  data = t,
+  x = daynight,
+  y = FScum_median,
+  type = "nonparametric", # for wilcoxon
+  boxplot.args = list(width = 0.15, fill = "turquoise4", alpha = 0.5),
+  violin.args = list(alpha = 0, colour = "grey70"),
+  point.args = list(alpha = 0),# to remove points
+  point.path = F,
+  ggtheme = theme_bw(),
+  centrality.plotting = T,
+  centrality.path = F,
+  centrality.point.args = list(alpha = 0),
+  results.subtitle =T
+)
+p1 <- p1 + labs(x= "", y = "Median hourly no. fast starts")+ theme(plot.subtitle=element_text(size=8, hjust=0, face="italic", color="black"))
+p1
+
+# NON DVM
+t1 <- hdata %>% filter(DVM == "nonDVM") %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) 
+t2 <- hdata %>% filter(DVM == "nonDVM") %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) %>% group_by(Date, sharkID) %>% summarise(n = n())
+t <- left_join(t1, t2, by = c("Date", "sharkID")) %>% filter(n == 2) %>% ungroup()
+table(t$daynight)
+
+wilcox.test(t$FScum_median ~ t$daynight,paired = TRUE, alternative = "greater")
+
+p2 <- ggstatsplot::ggwithinstats( # paired samples
+  data = t,
+  x = daynight,
+  y = FScum_median,
+  type = "nonparametric", # for wilcoxon
+  boxplot.args = list(width = 0.15, fill = "turquoise4", alpha = 0.5),
+  violin.args = list(alpha = 0, colour = "grey70"),
+  point.args = list(alpha = 0),# to remove points
+  point.path = F,
+  ggtheme = theme_bw(),
+  centrality.plotting = T,
+  centrality.path = F,
+  centrality.point.args = list(alpha = 0),
+  results.subtitle =T
+)
+p2
+p2 <- p2 + labs(x= "", y = "Median hourly no. fast starts")+ theme(plot.subtitle=element_text(size=8, hjust=0, face="italic", color="black"))
+
+p <- (p1|p2) + plot_annotation(tag_levels = 'A')
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig14_FS95_cum-DVM_nonDVM_daynight.png"), width = 25, height = 11, units = "cm")
+```
+
+Figure S15: Inter-individual differences in median hourly cumulated fast start distributions for day and night. Results from a Wilcoxon signed rank test are shown for each individual shark. Violin plots in grey represent the full distribution of the data. Boxplot show median and lower and upper quartiles with whiskers extending to 1.5*IQR.
+
+```{r}
+# Individual differences
+t1 <- hdata  %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) 
+t2 <- hdata  %>% group_by(Date, sharkID, daynight) %>% summarise(FScum_median = median(FS95_cum)) %>% group_by(Date, sharkID) %>% summarise(n = n())
+t <- left_join(t1, t2, by = c("Date", "sharkID")) %>% filter(n == 2) %>% ungroup()
+table(t$daynight)
+
+p <- ggplot(data = t)+
+  geom_boxplot(aes(x = daynight, y = FScum_median),outlier.alpha = 0.3)+
+  facet_wrap(~sharkID)+
+  theme_bw()+
+  labs(x = "",
+       y = "Median hourly fast stats")
+ggsave(p1, filename = paste0("plots/spurdog/Activity/FS95_cum-DVMvsnonDVM.png"), width = 12, height = 10, units = "cm")
+
+
+for(s in sharks){
+  ts <- t %>% filter(sharkID == s)#
+  assign(
+    paste0("p",s), 
+    ggstatsplot::ggwithinstats( # paired samples
+      data = ts,
+      x = daynight,
+      y = FScum_median,
+      type = "nonparametric", # for wilcoxon
+      boxplot.args = list(width = 0.15, fill = "turquoise4", alpha = 0.5),
+      violin.args = list(alpha = 0, colour = "grey70"),
+      point.args = list(alpha = 0),# to remove points
+      point.path = F,
+      ggtheme = theme_bw(),
+      centrality.plotting = F,
+      centrality.path = F,
+      centrality.point.args = list(alpha = 0),
+      results.subtitle =T,
+      xlab = "", 
+      ylab  = "Meadian hourly no. fast starts",
+      title  = paste0("Shark ", s)
+    )
+  )
+}
+p1 <- p1 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p2 <- p2 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p3 <- p3 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p4 <- p4 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p5 <- p5 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p6 <- p6 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p7 <- p7 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p8 <- p8 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p9 <- p9 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p10 <- p10 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p11 <- p11 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p12 <- p12 +  theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p13 <- p13 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p14 <- p14 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p15 <- p15 + theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p16 <- p16 +  theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p17 <- p17 +  theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p18 <- p18 +  theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+p19 <- p19 +  theme(plot.subtitle=element_text(size=5.5, hjust=0, face="italic", color="black"))
+## combining the individual plots into a single plot
+p <- ggstatsplot::combine_plots(
+  plotlist = list(p1, p2, p3, p4, p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,p16,p17,p18,p19),
+  plotgrid.args = list(nrow = 5)
+  # annotation.args = list(title = "Individual hourly fast starts over day and night")
+)
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig15_FS95_cum-Ind_DayNight.png"), width = 35, height = 40, units = "cm")
+
+# FScum_day > FScum_night
+for(s in sharks){
+  ts <- t %>% filter(sharkID == s)#
+  print(s)
+  print(wilcox.test(ts$FScum_median ~ ts$daynight,paired = T, alternative = "greater"))
+}
+# FScum_day < FScum_night
+for(s in sharks){
+  ts <- t %>% filter(sharkID == s)#
+  print(s)
+  print(wilcox.test(ts$FScum_median ~ ts$daynight, alternative = "less"))
+}
+```
+
+### FS95: seasonal differences
+
+Figure S16: Differences in hourly cumulated fast starts per months for shark 11,12,14,15,17,18, and 19 which covered a minimum of 320 days. The red dashed line marks the population median (8 fast starts) of the seven individuals across months. The y-axis was limited to 200 for visualisation purposes. Violin plots in grey represent the full distribution of the data. Boxplot show median and lower and upper quartiles with whiskers extending to 1.5 * IQR.
+```{r}
+tpop <- hdata %>% filter(sharkID %in% c(11,12,14,15,17,18,19)) 
+m <- median(tpop$FS95_cum)
+m
+p <- ggplot(data = hdata %>% filter(sharkID %in% c(11,12,14,15)))+
+  geom_hline(yintercept = m, colour = "firebrick", linetype = "dashed")+
+  geom_violin(aes(x = as.factor(Month), y = FS95_cum), width = 1, alpha = 1, colour = "grey70")+
+  geom_boxplot(aes(x = as.factor(Month), y = FS95_cum), outlier.alpha = 0, width = 0.3, fill = "turquoise4", alpha = 0.5)+
+  scale_y_continuous(limits = c(0,200))+#trans = "log10")+
+  theme_bw()+
+  labs(x = "Month", 
+       y = "Hourly no. fast stats")
+p
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig16_FS95_cum-Season_sharks_11-12_14-15_17-19.png"), width = 15, height = 10, units = "cm")
+
+t <- hdata %>% filter(sharkID %in% c(11,12,14,15,17,18,19) & Month == 10)
+median(t$FS95_cum)
+quantile(t$FS95_cum, p = c(0.25,0.5,0.75))
+mean(t$FS95_cum)
+tpop <- hdata %>% filter(sharkID %in% c(11,12,14,15,17,18,19)) 
+m <- median(tpop$FS95_cum)
+#wilcox.test(x = t$FS95_cum, mu = m, alternative = "greater")
+```
+
+### Environmental effects on FS95
+
+Light: Negative relationship with light - darker/twilight = more active
+Temperature: negative relationship with temp - lower temp = more active
+Depth: negative relationship with depth - deeper = more active
+
+Figure S17: Environmental relationships of light level (A), temperature (B) and depth (C) on the median hourly number of fast starts. Medians of fast starts were taken across bins of 1 light level unit, 0.1°C, and 10m respectively. Bins with n<100 are disregarded. Red line marks a fitted loess function with span = 0.75. 95% confidence intervals shown in grey. A description of how light levels correspond to light intensity is provided in supplementary material above.
+
+```{r}
+# light
+t <- hdata %>% mutate(light_bin = cut(Lightlevel_median,
+                                   breaks=seq(25,225,1), 
+                                   labels = FALSE) + 25) %>% 
+         group_by(light_bin) %>% 
+         summarise(FS_median = median(FS95_cum),
+                   n = n()) %>% 
+         filter(n>100 & !is.na(light_bin))
+cor(t$light_bin, t$FS_median, method = 'pearson')
+
+p1 <- ggplot(data = t, 
+       aes(x = light_bin, y = FS_median))+
+  geom_point()+
+  geom_smooth(colour = "firebrick",  linewidth = 0.5,method = "loess",span = 0.75,level = 0.95)+ 
+  theme_bw()+
+  labs(x= "Light level", y = "Median hourly no. of fast starts")
+
+# temp
+t <- hdata %>% 
+         mutate(temp_bin = 0.1*cut(Temp_median,
+                              breaks=seq(4.5,16.7,0.1), 
+                              labels = FALSE) + 4.5) %>% 
+         #select(temp_bin, Temp_median)
+         group_by(temp_bin) %>% 
+         summarise(FS_median = median(FS95_cum),
+                   n = n()) %>% 
+         filter(n>100)
+cor(t$temp_bin, t$FS_median, method = 'pearson')
+
+p2 <-ggplot(data = t, 
+       aes(x = temp_bin, y = FS_median))+
+  geom_point()+
+  geom_smooth(colour = "firebrick", linewidth = 0.5, method = "loess",span = 0.75,level = 0.95)+ 
+  theme_bw()+
+  labs(x= "Temp [\u00B0C]", y = "Median hourly no. of fast starts")
+
+
+# depth
+t <-  hdata %>% 
+         mutate(depth_bin = 10* cut(Depth_median,
+                                   breaks=seq(0,580,10), 
+                                   labels = FALSE)) %>% 
+         group_by(depth_bin) %>% 
+         summarise(FS_median= median(FS95_cum),
+                   n = n()) %>% 
+         filter(n>100)
+
+cor(t$depth_bin, t$FS_median, method = 'pearson')
+
+p3 <-ggplot(data =t, aes(x = depth_bin, y = FS_median))+
+  geom_point()+
+  geom_smooth(colour = "firebrick", linewidth = 0.5, method = "loess",span = 0.75,level = 0.95)+ 
+  theme_bw()+
+  labs(x= "Depth [m]", y = "Median hourly no. of fast starts")
+p <- p1/p2/p3 + plot_annotation(tag_levels = 'A')
+
+ggsave(p, filename = paste0("plots/spurdog/supplement/fig17_FS95_Light_Temp_Depth.png"), width = 15, height = 25, units = "cm")
+p
+```
+
+### Vertical occupancy and activity hotspots 
+
+Figure 6: Vertical occupancy and activity hotspots across months calculated as the scaled number of fast starts in each 10m depth bin and hour of day. The number of data points per month by which data was scaled is noted in brackets together with the number of individuals which contributed to each month.  Dotted vertical lines mark the median hour of sunrise and sunset for a given month.
+
+```{r}
+nsharks <- ddata %>% group_by(Month) %>% reframe(n = length(unique(sharkID)))
+npermonth <- data %>% mutate(Month= month(Date, label = T, abbr = T)) %>% group_by(Month) %>% summarise(n = n())
+# density for full data
+t <- data %>% mutate(Month = month(DateTime, label = T, abbr = T), Hour = hour(DateTime)) %>% 
+  mutate(depth_bin = 10* cut(Depth, breaks=seq(0,580,10), labels = FALSE)) %>% 
+        group_by(depth_bin, Hour, Month) %>% 
+        summarise(
+           FS = sum(FS95),  # vulnerability (occupancy*activity) no fast starts in a given month, depth bin and hour of day
+           occupancy = n()) %>% # occupancy - no 5sec spent in a grid cell (month, depth bin, hour of day)
+        mutate(FS_rel = FS/occupancy) # activity - proportion of FS in a grid cell relative to no of hours (month, depth bin, hour of day) 
+
+# add monthly median hour of sunrise and sunset
+suntimes <- ddata %>% mutate(Month= month(Date, label = T, abbr = T), sunset_h = hour(sunset),  sunrise_h = hour(sunrise)) %>% 
+          group_by(Month) %>% 
+         summarise(sunrise = median(sunrise_h),
+                   sunset = median(sunset_h))
+t <- left_join(t, suntimes)
+# add counts per month
+t <- left_join(t, npermonth)
+
+# plot availability landscape
+ggplot(data = t)+
+  geom_tile(aes(x = Hour, y = depth_bin, fill = FS/n))+ # scaled by no of data points per month
+  geom_hline(yintercept = 0, linetype = "solid")+
+  geom_vline(aes(xintercept = sunrise), linetype = "dotted", colour = "grey40")+
+  geom_vline(aes(xintercept = sunset), linetype = "dotted", colour = "grey40")+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = seq(2,22,2), expand = c(0,0))+
+  scale_fill_gradientn(colors = c("#fef4dcff","#FDE4A6FF","#FECC8FFF","#FEB37BFF",
+                      "#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF",
+                      "#c83158ff","#bc004cff","#ab114fff"), 
+                      values = c(0,0.25,0.4,0.6,1), 
+                      oob = scales::squish, 
+                      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"),
+                      name = "scaled\nfast starts")+
+  facet_wrap(~Month, nrow = 4, labeller = stickylabeller::label_glue('{Month} (n = {npermonth$n}, ind = {nsharks$n})'))+
+  labs(y = "Depth [m]")+
+  theme_bw()
+
+ggsave(filename = paste0("plots/spurdog/paper/fig6_availability-landscape_scaled.png"), width =20, height = 20, units = "cm")
+#ggsave(filename = paste0("plots/spurdog/supplement/figS18_availability-landscape_scaled_5d-rm.png"), width =20, height = 20, units = "cm")
+```
+
+Figure S12 (S18 with the first 120h removed): Vertical occupancy (A) and activity (B) landscapes for each month based on 5-sec resolution PSAT data with the first 24h after tagging removed (in case of S12 with 5 days after tagging removed). Data is aggregated by month in 10m depth bins and hour of day. The number of data points per month by which data was scaled is noted in brackets. (A) Vertical occupancy calculated as the number of data points within each depth-time cell divided by the number of data points within the respective month. (B) Activity calculated as the proportion of fast starts within each depth-time cell divided by the number of data points per month. Dotted vertical lines mark the median hour of sunrise and sunset for a given month.
+
+High activity in November does not seem to be associated with tagging. With five instead of one day removed after tagging the patterns remain consistent.
+```{r}
+# occupancy landscape
+occ_landscape <-ggplot(data = t)+
+  geom_tile(aes(x = Hour, y = depth_bin, fill = occupancy/n))+ # scaled
+  geom_hline(yintercept = 0, linetype = "solid")+
+  geom_vline(aes(xintercept = sunrise), linetype = "dotted", colour = "grey40")+
+  geom_vline(aes(xintercept = sunset), linetype = "dotted", colour = "grey40")+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = seq(2,22,2), expand = c(0,0))+
+  scale_fill_gradientn(colors = c("#fef4dcff","#FDE4A6FF","#FECC8FFF","#FEB37BFF",
+                      "#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF",
+                      "#c83158ff","#bc004cff","#ab114fff"), 
+                      values = c(0,0.25,0.4,0.6,1), 
+                      oob = scales::squish, 
+                      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"),
+                      name = "density")+ # occupancy [hours]
+facet_wrap(~Month, nrow = 4, labeller = stickylabeller::label_glue('{Month} (n = {npermonth$n})'))+
+  labs(y = "Depth [m]")+
+  theme_bw()
+
+ggsave(plot = occ_landscape, filename = paste0("plots/spurdog/supplement/fig11_occupancy-landscape_scaled.png"), width =20, height = 20, units = "cm")
+#ggsave(plot = occ_landscape, filename = paste0("plots/spurdog/supplement/fig12_occupancy-landscape_scaled_5d-rm.png"), width =20, height = 20, units = "cm")
+
+# activity landscape
+act_landscape <- ggplot(data = t)+
+  geom_tile(aes(x = Hour, y = depth_bin, fill = FS_rel/n))+ # scaled
+  geom_hline(yintercept = 0, linetype = "solid")+
+  geom_vline(aes(xintercept = sunrise), linetype = "dotted", colour = "grey40")+
+  geom_vline(aes(xintercept = sunset), linetype = "dotted", colour = "grey40")+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = seq(2,22,2), expand = c(0,0))+
+  scale_fill_gradientn(colors = c("#fef4dcff","#FDE4A6FF","#FECC8FFF","#FEB37BFF",
+                      "#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF",
+                      "#c83158ff","#bc004cff","#ab114fff"), 
+                      values = c(0,0.25,0.4,0.6,1), 
+                      oob = scales::squish, 
+                      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"),
+                      name = "scaled prop. of\nfast starts")+
+facet_wrap(~Month, nrow = 4, labeller = stickylabeller::label_glue('{Month} (n = {npermonth$n})'))+
+  labs(y = "Depth [m]")+
+  theme_bw()
+
+ggsave(plot = act_landscape, filename = paste0("plots/spurdog/supplement/fig12_Activity-landscape_scaled.png"),width =20, height = 20, units = "cm")
+#ggsave(plot = act_landscape, filename = paste0("plots/spurdog/supplement/fig18_Activity-landscape_scaled_5d-rm.png"),width =20, height = 20, units = "cm")
+
+p <- (occ_landscape | act_landscape) + plot_annotation(tag_levels = 'A')
+
+ggsave(plot = p, filename=paste0("plots/spurdog/supplement/fig12_Activity-Occupancy_landscape_scaled.png"),width =40, height = 20, units = "cm")
+#ggsave(plot = p, filename=paste0("plots/spurdog/supplement/fig18_Activity-Occupancy_landscape_scaled_5d-rm.png"),width =40, height = 20, units = "cm")
+```
+
+#### Threshold choice - Sensitivity analysis
+
+To check that the choice of the MA threshold did not affect the overall activity patterns observed in time and space we inspect this for a 97 and 99% threshold as well. We see other than reducing the activity there is no clear trend in time and space.
+
+Figure S3: Activity seascapes for each month based on 5-sec resolution PSAT data with fast starts calculated using a (A) 97% and (B) 99% MA threshold. Data is aggregated by month in 10m depth bins and hour of day. Dotted vertical lines mark the median hour of sunrise and sunset for a given month.
+
+```{r}
+### FS97
+####
+
+nsharks <- ddata %>% group_by(Month) %>% reframe(n = length(unique(sharkID)))
+npermonth <- data %>% mutate(Month= month(Date, label = T, abbr = T)) %>% group_by(Month) %>% summarise(n = n())
+# density for full data
+t <- data %>% mutate(Month = month(DateTime, label = T, abbr = T), Hour = hour(DateTime)) %>% 
+  mutate(depth_bin = 10* cut(Depth, breaks=seq(0,580,10), labels = FALSE)) %>% 
+        group_by(depth_bin, Hour, Month) %>% 
+        summarise(
+           FS = sum(FS97),  # vulnerability (occupancy*activity) no fast starts in a given month, depth bin and hour of day
+           occupancy = n()) %>% # occupancy - no 5sec spent in a grid cell (month, depth bin, hour of day)
+        mutate(FS_rel = FS/occupancy) # activity - proportion of FS in a grid cell relative to no of hours (month, depth bin, hour of day) 
+
+# add monthly median hour of sunrise and sunset
+suntimes <- ddata %>% mutate(Month= month(Date, label = T, abbr = T), sunset_h = hour(sunset),  sunrise_h = hour(sunrise)) %>% 
+          group_by(Month) %>% 
+         summarise(sunrise = median(sunrise_h),
+                   sunset = median(sunset_h))
+t <- left_join(t, suntimes)
+# add counts per month
+t <- left_join(t, npermonth)
+
+# activity seascape
+act_landscape97 <- ggplot(data = t)+
+  geom_tile(aes(x = Hour, y = depth_bin, fill = FS_rel/n))+ # scaled
+  geom_hline(yintercept = 0, linetype = "solid")+
+  geom_vline(aes(xintercept = sunrise), linetype = "dotted", colour = "grey40")+
+  geom_vline(aes(xintercept = sunset), linetype = "dotted", colour = "grey40")+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = seq(2,22,2), expand = c(0,0))+
+  scale_fill_gradientn(colors = c("#fef4dcff","#FDE4A6FF","#FECC8FFF","#FEB37BFF",
+                      "#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF",
+                      "#c83158ff","#bc004cff","#ab114fff"), 
+                      values = c(0,0.25,0.4,0.6,1), 
+                      oob = scales::squish, 
+                      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"),
+                      name = "scaled prop. of\nfast starts")+
+facet_wrap(~Month, nrow = 4, labeller = stickylabeller::label_glue('{Month} (n = {npermonth$n})'))+
+  labs(y = "Depth [m]")+
+  theme_bw()
+
+ggsave(plot = act_landscape97, filename = paste0("plots/spurdog/supplement/fig3_Activity-seascape_FS97_scaled.png"),width =20, height = 20, units = "cm")
+
+### FS99
+####
+
+nsharks <- ddata %>% group_by(Month) %>% reframe(n = length(unique(sharkID)))
+npermonth <- data %>% mutate(Month= month(Date, label = T, abbr = T)) %>% group_by(Month) %>% summarise(n = n())
+# density for full data
+t2 <- data %>% mutate(Month = month(DateTime, label = T, abbr = T), Hour = hour(DateTime)) %>% 
+  mutate(depth_bin = 10* cut(Depth, breaks=seq(0,580,10), labels = FALSE)) %>% 
+        group_by(depth_bin, Hour, Month) %>% 
+        summarise(
+           FS = sum(FS99),  # vulnerability (occupancy*activity) no fast starts in a given month, depth bin and hour of day
+           occupancy = n()) %>% # occupancy - no 5sec spent in a grid cell (month, depth bin, hour of day)
+        mutate(FS_rel = FS/occupancy) # activity - proportion of FS in a grid cell relative to no of hours (month, depth bin, hour of day) 
+
+# add monthly median hour of sunrise and sunset
+suntimes <- ddata %>% mutate(Month= month(Date, label = T, abbr = T), sunset_h = hour(sunset),  sunrise_h = hour(sunrise)) %>% 
+          group_by(Month) %>% 
+         summarise(sunrise = median(sunrise_h),
+                   sunset = median(sunset_h))
+t2 <- left_join(t2, suntimes)
+# add counts per month
+t2 <- left_join(t2, npermonth)
+
+# activity seascape
+act_landscape99 <- ggplot(data = t2)+
+  geom_tile(aes(x = Hour, y = depth_bin, fill = FS_rel/n))+ # scaled
+  geom_hline(yintercept = 0, linetype = "solid")+
+  geom_vline(aes(xintercept = sunrise), linetype = "dotted", colour = "grey40")+
+  geom_vline(aes(xintercept = sunset), linetype = "dotted", colour = "grey40")+
+  scale_y_reverse()+
+  scale_x_continuous(breaks = seq(2,22,2), expand = c(0,0))+
+  scale_fill_gradientn(colors = c("#fef4dcff","#FDE4A6FF","#FECC8FFF","#FEB37BFF",
+                      "#FD9A6AFF","#FA815FFF","#F4685CFF","#E85362FF",
+                      "#c83158ff","#bc004cff","#ab114fff"), 
+                      values = c(0,0.25,0.4,0.6,1), 
+                      oob = scales::squish, 
+                      guide = guide_colorbar(frame.colour = "black", ticks.colour = "black"),
+                      name = "scaled prop. of\nfast starts")+
+facet_wrap(~Month, nrow = 4, labeller = stickylabeller::label_glue('{Month} (n = {npermonth$n})'))+
+  labs(y = "Depth [m]")+
+  theme_bw()
+
+ggsave(plot = act_landscape99, filename = paste0("plots/spurdog/supplement/fig3_Activity-seascape_FS99_scaled.png"),width =20, height = 20, units = "cm")
+
+p <- (act_landscape97 | act_landscape99) + plot_annotation(tag_levels = 'A')
+ggsave(plot = p, filename=paste0("plots/spurdog/supplement/fig3_Activity-Occupancy_seascapeFS9799_scaled.png"),width =40, height = 20, units = "cm")
+
+```
+
+
